@@ -73,7 +73,7 @@ class SearchHandler(BaseHandler):
   def _parse_query(self, query):
     group = int(query.get('g', 0))
     terms = query.get('q')
-    sender = int(query.get('sender', 0))
+    sender = self._parse_sender(query.get('sender'))
     start = query.get('start')
     if start:
       start = util.fromtimestamp(int(start))
@@ -81,6 +81,12 @@ class SearchHandler(BaseHandler):
     if end:
       end = util.fromtimestamp(int(end))
     return SearchQuery(group, terms, sender, start, end)
+
+  def _parse_sender(self, sender):
+    if not sender:
+      return None
+    sender = [int(s) for s in sender.split(',') if s.strip()]
+    return [s for s in sender if s] or None
 
 class GroupsHandler(BaseHandler):
   async def _get(self, request):

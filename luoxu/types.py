@@ -4,7 +4,7 @@ import datetime
 class SearchQuery(NamedTuple):
   group: int
   terms: Optional[str]
-  sender: Optional[str]
+  sender: Optional[list[int]]
   start: Optional[datetime.datetime]
   end: Optional[datetime.datetime]
 

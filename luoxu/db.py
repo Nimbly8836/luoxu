@@ -209,7 +209,7 @@ class PostgreStore:
         highlight = f'''pgroonga_highlight_html(text, pgroonga_query_extract_keywords(${len(params)+1})) as html'''
         params.append(query)
       if q.sender:
-        sql += f''' and from_user in (${len(params)+1})'''
+        sql += f''' and from_user = any(${len(params)+1}::bigint[])'''
         params.append(q.sender)
 
       sql += f''' and created_at > ${len(params)+1}'''
@@ -250,4 +250,3 @@ class PostgreStore:
       return [(uid, r['name'])
               for r in await conn.fetch(sql, *args)
               for uid in r['uid']]
-
