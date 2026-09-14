@@ -10,14 +10,20 @@ RUN apt-get update \
  && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly \
  && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt pyproject.toml MANIFEST.in README.md ./
+# Resolve third-party wheels separately so source changes reuse this layer.
+COPY requirements.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip wheel --no-deps --wheel-dir /wheels -r requirements.txt
+
+COPY pyproject.toml MANIFEST.in README.md ./
 COPY querytrans ./querytrans
 COPY luoxu-cutwords ./luoxu-cutwords
 COPY luoxu ./luoxu
 COPY luoxu_plugins ./luoxu_plugins
 COPY openapi.yaml ghost.jpg nobody.jpg ./
-RUN pip wheel --no-cache-dir --no-deps --wheel-dir /wheels . \
- && pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/build/target \
+    pip wheel --no-cache-dir --no-deps --wheel-dir /wheels .
 
 FROM python:3.12-slim-bookworm AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
