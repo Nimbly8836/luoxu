@@ -451,8 +451,8 @@ async def require_admin(request):
 
 
 class AdminHandler:
-  def __init__(self, db, auth):
-    self.db, self.auth = db, auth
+  def __init__(self, db, auth, add_group=None):
+    self.db, self.auth, self.group_adder = db, auth, add_group
 
   async def users(self, request):
     await require_admin(request)
@@ -577,6 +577,20 @@ class AdminHandler:
       raise web.HTTPBadRequest(text=str(exc)) from exc
     return web.Response(status=204)
 
+  async def add_group(self, request):
+    await require_admin(request)
+    if self.group_adder is None:
+      raise web.HTTPServiceUnavailable(text="group monitoring is unavailable")
+    data = await _json_body(request)
+    target = data.get("group")
+    if not isinstance(target, (str, int)) or not str(target).strip():
+      raise web.HTTPBadRequest(text="group is required")
+    try:
+      group = await self.group_adder(str(target).strip())
+    except (TypeError, ValueError) as exc:
+      raise web.HTTPBadRequest(text="invalid group") from exc
+    return web.json_response({"conversation": _conversation_json(group)}, status=201)
+
   async def public_revoke(self, request):
     await require_admin(request)
     await self.db.revoke_public(_uuid(request.match_info["conversation_id"]))
@@ -664,6 +678,7 @@ def setup_app(
   auth_service=None,
   history_enabled=False,
   context_config=None,
+  add_group=None,
 ):
   app = web.Application(middlewares=[cors_middleware, auth_middleware])
   app["origins"] = origins
@@ -697,7 +712,7 @@ def setup_app(
   app.router.add_post(f"{prefix}/auth/refresh", auth.refresh)
   app.router.add_get(f"{prefix}/auth/me", auth.me)
   app.router.add_post(f"{prefix}/auth/sessions/revoke", auth.revoke_sessions)
-  admin = AdminHandler(dbconn, auth_service)
+  admin = AdminHandler(dbconn, auth_service, add_group)
   app.router.add_get(f"{prefix}/admin/users", admin.users)
   app.router.add_get(f"{prefix}/admin/conversations", admin.conversations)
   app.router.add_get(f"{prefix}/admin/users/{{user_id}}/grants", admin.user_grants)
@@ -711,6 +726,7 @@ def setup_app(
   app.router.add_delete(
     f"{prefix}/admin/users/{{user_id}}/grants/{{conversation_id}}", admin.revoke
   )
+  app.router.add_post(f"{prefix}/admin/groups", admin.add_group)
   app.router.add_post(f"{prefix}/admin/public/{{conversation_id}}", admin.public_grant)
   app.router.add_delete(
     f"{prefix}/admin/public/{{conversation_id}}", admin.public_revoke

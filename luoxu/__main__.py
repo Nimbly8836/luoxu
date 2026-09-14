@@ -116,6 +116,7 @@ class Indexer:
       auth_service=auth,
       history_enabled=history_enabled,
       context_config=web_config.get("context"),
+      add_group=self.add_group,
     )
     runner = web.AppRunner(app)
     await runner.setup()
@@ -259,6 +260,23 @@ class Indexer:
       gis.cancel()
       with contextlib.suppress(asyncio.CancelledError):
         await gis
+
+  async def add_group(self, target):
+    if self.client is None or self.dbstore is None:
+      raise RuntimeError("Telegram client is not ready")
+    try:
+      entity = cast(Any, await self.client.get_entity(target if not target.lstrip("-").isdigit() else int(target)))
+    except Exception as exc:
+      raise ValueError("group not found") from exc
+    if entity.id in self.group_forward_history_done:
+      async with self.dbstore.get_conn() as conn:
+        return await self.dbstore.get_group(conn, entity.id)
+    info = await self.init_group(entity)
+    self.group_forward_history_done[entity.id] = False
+    self.client.add_event_handler(self.on_message, events.NewMessage(chats=[entity]))
+    self.client.add_event_handler(self.on_message, events.MessageEdited(chats=[entity]))
+    asyncio.create_task(GroupHistoryIndexer(entity, info, entity.id not in self.ocr_ignore_group_ids).run(self.client, self.dbstore, partial(operator.setitem, self.group_forward_history_done, entity.id, True)))
+    return info
 
   async def init_group(self, group):
     logger.info("init_group: %r", group.title)
