@@ -22,6 +22,7 @@ class MediaMgr:
       key = media.document.id
 
     async with self._media_cache_lock:
+      self._media_cache.expire()
       cached = self._media_cache.get(key)
       if cached is None:
         # coroutine cannot be awaited twice, but task can

@@ -2,6 +2,7 @@ import logging
 import os
 import sqlite3
 from typing import Optional
+import datetime
 
 from telethon import events
 
@@ -96,6 +97,12 @@ class TgChannelWatcher:
   async def process_message(self, msg):
     channel_id = msg.peer_id.channel_id
     event_id = self.db.get_matrix_event_id(channel_id, msg.id)
+
+    now = datetime.datetime.now().astimezone()
+    if not event_id and now - msg.date > datetime.timedelta(days=30):
+      # don't create old messages
+      return
+
     if msg.reply_to and (replied_to := msg.reply_to.reply_to_msg_id):
       reply_to = self.db.get_matrix_event_id(channel_id, replied_to)
     else:
