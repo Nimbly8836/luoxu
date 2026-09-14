@@ -1,0 +1,86 @@
+services:
+  db:
+    image: groonga/pgroonga:4.0.8-alpine-17-slim
+    profiles: [core, web]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-luoxu}
+      POSTGRES_USER: ${POSTGRES_USER:-luoxu}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - luoxu-db:/var/lib/postgresql/data
+      - ./dbsetup.sql:/docker-entrypoint-initdb.d/001-dbsetup.sql:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${LUOXU_IMAGE:-ghcr.io/nimbly8836/luoxu:latest}
+    profiles: [core]
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${LUOXU_PORT:-9008}:9008"
+    volumes:
+      - ./config.toml:/config/config.toml:ro
+      - luoxu-session:/data
+      - luoxu-cache:/app/cache
+    command: ["python", "-m", "luoxu", "--config", "/config/config.toml"]
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${LUOXU_IMAGE:-ghcr.io/nimbly8836/luoxu:latest}
+    profiles: [web]
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${LUOXU_PORT:-9008}:9008"
+    volumes:
+      - ./config.toml:/config/config.toml:ro
+      - luoxu-cache:/app/cache
+    command: ["python", "-m", "luoxu.web", "--config", "/config/config.toml"]
+
+  ocr:
+    build:
+      context: ./docker/ocr
+      dockerfile: Dockerfile
+      target: cpu-final
+    image: luoxu-ocr:cpu-3.2.2
+    profiles: [ocr]
+    expose:
+      - "12345"
+    environment:
+      HOST: 0.0.0.0
+      MAX_UPLOAD_BYTES: ${OCR_MAX_UPLOAD_BYTES:-10485760}
+      PADDLEOCR_LANG: ${PADDLEOCR_LANG:-ch}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen(
+              'http://127.0.0.1:12345/health'
+          )
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  luoxu-db:
+  luoxu-session:
+  luoxu-cache:

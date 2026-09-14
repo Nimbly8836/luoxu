@@ -1,0 +1,27 @@
+# Never send credentials, sessions, or local state to the Docker daemon.
+.git
+.gitignore
+.env
+.env.*
+config.toml
+*.session
+*.session-journal
+cache/
+.data/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Build artifacts and unrelated repository material.
+**/target/
+*.egg-info/
+dist/
+build/
+node_modules/
+.venv/
+venv/
+Dockerfile*
+docker-compose*.yml
+Dockerfile

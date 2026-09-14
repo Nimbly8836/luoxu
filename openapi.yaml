@@ -1,0 +1,367 @@
+openapi: 3.1.0
+info:
+  title: Luoxu API
+  version: 1.0.0
+  description: >-
+    Telegram message archive search, authentication, context, and
+    administration API.
+servers:
+  - url: /luoxu
+security: []
+paths:
+  /auth/login:
+    post:
+      summary: Log in
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+                  format: password
+      responses:
+        '200':
+          description: Access and refresh tokens
+        '401':
+          description: Invalid credentials
+  /auth/refresh:
+    post:
+      summary: Rotate a refresh token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+      responses:
+        '200':
+          description: New token pair
+        '401':
+          description: Invalid refresh token
+  /auth/me:
+    get:
+      summary: Get the current authenticated user
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Current user
+        '401':
+          description: Authentication required
+  /auth/sessions/revoke:
+    post:
+      summary: Revoke all refresh sessions for the current user
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Sessions revoked
+        '401':
+          description: Authentication required
+  /groups:
+    get:
+      summary: List accessible legacy groups
+      responses:
+        '200':
+          description: Groups visible to the current identity
+  /conversations:
+    get:
+      summary: List accessible conversations
+      responses:
+        '200':
+          description: Groups, topics, and authorized private chats
+  /search:
+    get:
+      summary: Search current non-deleted message state
+      parameters:
+        - name: g
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: conversation_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: sender
+          in: query
+          schema:
+            type: string
+            example: 123,456
+        - name: start
+          in: query
+          schema:
+            type: integer
+        - name: end
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Search result
+        '404':
+          description: Conversation not accessible
+  /names:
+    get:
+      summary: Search sender names in accessible groups
+      parameters:
+        - name: g
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Matching names
+  /conversations/{conversation_id}/messages/{message_id}:
+    get:
+      summary: Get a message
+      parameters:
+        - $ref: '#/components/parameters/conversation_id'
+        - $ref: '#/components/parameters/message_id'
+      responses:
+        '200':
+          description: Message or deleted marker
+        '404':
+          description: Not found or not accessible
+  /conversations/{conversation_id}/messages/{message_id}/context:
+    get:
+      summary: Get surrounding messages and reply chain
+      parameters:
+        - $ref: '#/components/parameters/conversation_id'
+        - $ref: '#/components/parameters/message_id'
+        - name: before
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 5
+            default: 5
+        - name: after
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 5
+            default: 5
+      responses:
+        '200':
+          description: Message context with a bounded reply chain
+        '404':
+          description: Not found or not accessible
+  /conversations/{conversation_id}/messages/{message_id}/history:
+    get:
+      summary: Get edit and delete snapshots
+      parameters:
+        - $ref: '#/components/parameters/conversation_id'
+        - $ref: '#/components/parameters/message_id'
+        - name: include_history
+          in: query
+          required: true
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Historical snapshots
+        '404':
+          description: History disabled, unavailable, or inaccessible
+  /docs:
+    get:
+      summary: Swagger UI
+      responses:
+        '200':
+          description: Public API documentation UI
+  /openapi.yaml:
+    get:
+      summary: OpenAPI document
+      responses:
+        '200':
+          description: OpenAPI 3.1 document
+  /avatar/{uid}.jpg:
+    get:
+      summary: Get an avatar for a sender visible to the current identity
+      parameters:
+        - name: uid
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Avatar image
+        '404':
+          description: Sender is not visible or has no avatar
+  /avatar/{name}.jpg:
+    get:
+      summary: Get a default or deleted-user avatar
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [nobody, ghost]
+      responses:
+        '200':
+          description: Avatar image
+  /admin/conversations:
+    get:
+      summary: List all conversations for permission management
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Administrator-only conversation list
+        '403':
+          description: Administrator required
+  /admin/users:
+    get:
+      summary: List users
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Administrator-only user list
+        '403':
+          description: Administrator required
+    post:
+      summary: Create a user
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: {type: string, maxLength: 64}
+                password: {type: string, format: password, minLength: 8}
+                is_admin: {type: boolean, default: false}
+      responses:
+        '201':
+          description: User created
+        '403':
+          description: Administrator required
+  /admin/users/{user_id}:
+    patch:
+      summary: Update, disable, or reset a user
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password: {type: string, format: password, minLength: 8}
+                is_active: {type: boolean}
+                is_admin: {type: boolean}
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Updated user
+        '403':
+          description: Administrator required
+    delete:
+      summary: Delete a user
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Deleted
+  /admin/users/{user_id}/grants/{conversation_id}:
+    put:
+      summary: Grant a user conversation access
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Granted
+    delete:
+      summary: Revoke a user conversation grant
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Revoked
+  /admin/public/{conversation_id}:
+    post:
+      summary: Add a conversation to anonymous pub access
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Granted
+    delete:
+      summary: Remove anonymous pub access
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Revoked
+  /admin/users/{user_id}/sessions/revoke:
+    post:
+      summary: Revoke all refresh sessions for a user
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Revoked
+components:
+  parameters:
+    conversation_id:
+      name: conversation_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    message_id:
+      name: message_id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

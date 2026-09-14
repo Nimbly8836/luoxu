@@ -12,6 +12,8 @@ dependencies = [
   "asyncpg",
   "telethon",
   "aiohttp",
+  "PyJWT>=2.8,<3",
+  "argon2-cffi>=23.1,<26",
   "tomli; python_version<'3.11'",
 ]
 

@@ -11,6 +11,8 @@ index_groups = [
   "@group2",
   "1000000000",
 ]
+# Explicit one-to-one chats only; private chats are never public by default.
+# index_private_chats = ["@alice", "123456789"]
 # ipv6 = false
 # socks5 proxy
 # proxy = ["127.0.0.1", "1080"]
@@ -37,4 +39,28 @@ ghost_avatar = "ghost.jpg"
 origins = [
   "http://localhost",
 ]
+public_groups = [
+  1000000000,
+]
+
+[web.auth]
+# Generate with: python -c "from luoxu.auth import AuthService; print(AuthService.random_secret())"
+jwt_secret = "replace-with-a-random-secret"
+access_token_ttl = 900
+refresh_token_ttl = 2592000
+
+[web.auth.bootstrap_admin]
+username = "admin"
+# Generate with: python -c "from luoxu.auth import AuthService; print(AuthService({'jwt_secret':'x'}).hash_password('change-me'))"
+password_hash = "$argon2id$v=19$..."
+
+[web.context]
+before = 5
+after = 5
+max_window = 20
+reply_depth = 5
+
+[web.message_history]
+# Privacy-sensitive feature; no snapshots are captured while false.
+enabled = false
 # vim: se ft=toml:
