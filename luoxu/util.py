@@ -7,15 +7,21 @@ except ImportError:
   import tomli as tomllib
 from telethon import TelegramClient
 
-def format_name(user) -> str:
+def format_name(user, *, sender_id=None) -> str:
   if user is None:
-    return '(null)'
+    return f'未知用户 ({sender_id})' if sender_id is not None else '(null)'
 
-  try:
-    l = [user.first_name, user.last_name]
-  except AttributeError:
-    return user.title # channel
-  return ' '.join(x for x in l if x)
+  name = ' '.join(
+    x for x in (getattr(user, 'first_name', None), getattr(user, 'last_name', None))
+    if x
+  ).strip()
+  if name:
+    return name
+  if title := getattr(user, 'title', None):
+    return title
+  uid = getattr(user, 'id', sender_id)
+  label = '已注销用户' if getattr(user, 'deleted', False) else '未知用户'
+  return f'{label} ({uid})' if uid is not None else label
 
 def fromtimestamp(ts: int) -> datetime.datetime:
   return datetime.datetime.fromtimestamp(ts).astimezone()
