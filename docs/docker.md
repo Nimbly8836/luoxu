@@ -32,6 +32,36 @@ maintain a small local override for that dependency). The local image is
 PGroonga-enabled; an external PostgreSQL server must provide the extensions
 required by `dbsetup.sql` itself.
 
+## Database upgrades
+
+Image replacement does **not** apply schema migrations. Existing database volumes
+also do not rerun `dbsetup.sql`. Back up the database and stop all old indexers
+and Python Web processes before upgrading. Apply only migrations not already
+applied, in order: `001_access_control.sql`, `002_conversations.sql`,
+`003_message_history.sql`, then `004_group_monitoring.sql`.
+
+If `001`–`003` are already applied, the local Compose database can be upgraded
+with (retain your existing Compose `-f` flags):
+
+```sh
+docker compose exec -T db sh -c \
+  'exec psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  < migrations/004_group_monitoring.sql
+```
+
+Use your normal authenticated PostgreSQL connection instead for an external DB.
+Fresh databases use only `dbsetup.sql`. Migration `004` adopts every existing
+registered group once as a manual monitoring reference, without publishing it
+or granting access. Old unwanted groups may resume; disable their manual
+reference through the admin API. Remaining account/public references still keep
+a group collecting. Repeating the migration does not resurrect disabled groups.
+See [group access and monitoring](group-access.md) for the full lifecycle.
+
+After migration, start the new image using the existing configuration and data.
+`telegram.index_groups` is imported once; after that the database is authoritative.
+A separate Web process can change stored references, but actual collection needs
+a running upgraded indexer; its refresh loop observes changes about every 2 seconds.
+
 ## Published images: no local build needed
 
 The main application is published as `ghcr.io/nimbly8836/luoxu:latest` and

@@ -110,9 +110,9 @@ Web API 支持账号密码登录和 JWT Bearer Token。未认证请求使用匿�
 
 在 `[web.auth]` 中配置随机 `jwt_secret`、token 有效期以及一次性的 bootstrap 管理员。管理员密码必须使用 Argon2id 哈希，不能写明文。管理员通过 `/admin/*` API 管理用户和会话授权。完整接口规范位于 `openapi.yaml`，运行后可在 `/luoxu/docs` 查看 Swagger UI。
 
-**监听不等于公开，也不等于给所有账号授权。** 管理员通过 `/admin/groups` 添加监听，通过 `/admin/users/{user_id}/grants/{conversation_id}` 按账号授权；只有加入 `/admin/public/{conversation_id}` 的群才对匿名和所有登录用户公开。需要区分 A、B 可见范围的群不要设为公开。管理列表 `/admin/conversations` 和添加响应包含 `is_public`，不要用 Telegram 用户名字段 `pub_id` 判断权限。操作流程、权限边界及动态监听的重启限制见[群组访问管理](docs/group-access.md)。
+**监听不等于公开，也不等于给所有账号授权。** 管理员通过 `/admin/groups` 添加监听，通过 `/admin/users/{user_id}/grants/{conversation_id}` 按账号授权；只有加入 `/admin/public/{conversation_id}` 的群才对匿名和所有登录用户公开。需要区分 A、B 可见范围的群不要设为公开。管理列表 `/admin/conversations` 和添加响应包含 `is_public`，不要用 Telegram 用户名字段 `pub_id` 判断权限。监听由持久化的手动引用、个人授权和公开授权共同维持；删除最后一个引用才停止采集，不删除归档。`GET /admin/groups` 列出有监听需求的群，`PUT/DELETE /admin/groups/{conversation_id}` 只增减手动引用。`telegram.index_groups` 仅首次导入，之后旧配置不会覆盖后台停用状态。操作流程、状态含义和升级规则见[群组访问管理](docs/group-access.md)。
 
-消息上下文支持 `/context?g={group_id}&id={message_id}` 和 `/conversations/{conversation_id}/messages/{message_id}/context` 两种入口（都需加上配置的 Web 前缀），默认返回前后各 5 条消息以及最多 5 层回复链；可用 `before`、`after`、`depth` 缩小窗口。两者返回相同的 `target`、`before`、`after`、`replies` 结构，只查询本地归档，消息未收录或无权限时返回 404。消息编辑/删除历史由 `[web.message_history].enabled` 控制，默认关闭；开启后还必须在请求中传 `include_history=true`。历史只从功能启用并在线捕获之后开始记录。
+消息上下文支持 `/context?g={group_id}&id={message_id}` 和 `/conversations/{conversation_id}/messages/{message_id}/context` 两种入口（都需加上配置的 Web 前缀）。`before/after` 是相邻消息；`replies` 从更早原文出发，包含后续回复和同一原文下的平行分支，原文不必命中本次搜索或处于窗口内。默认前后各 5 条、先向前最多 5 层再向后展开最多 5 层、额外讨论消息最多 100 条；可用 `before`、`after`、`depth`、`reply_limit` 缩小范围。检查新增的 `replies_meta` 判断是否截断、缺失或删除，不能把有限本地归档当作 Telegram 完整历史。两接口只查当前身份可访问的本地归档，不访问 Telegram；目标缺失或无权限返回 404。详见[消息上下文与整段讨论](docs/message-context.md)。消息编辑/删除历史由 `[web.message_history].enabled` 控制，默认关闭；开启后还必须在请求中传 `include_history=true`。历史只从功能启用并在线捕获之后开始记录。
 
 头像请求使用 `/avatar/{uid}.jpg`，每次先检查当前身份是否可见该发送者。成功解析的用户头像在服务端缓存 5 分钟，命中时无需再请求 Telegram；过期后先返回已有图片并后台刷新。用户头像响应为 `private, no-store`，图片文件仍保留在服务端磁盘缓存中，用户到图片的映射缓存在进程内。
 
@@ -123,7 +123,7 @@ Web API 支持账号密码登录和 JWT Bearer Token。未认证请求使用匿�
 数据库升级
 ====
 
-全新数据库执行 `dbsetup.sql`。已有数据库按顺序执行 `migrations/001_access_control.sql`、`migrations/002_conversations.sql` 和 `migrations/003_message_history.sql`。升级前请备份数据库。
+全新数据库执行 `dbsetup.sql`。已有数据库按顺序执行尚未应用的 `migrations/001_access_control.sql`、`migrations/002_conversations.sql`、`migrations/003_message_history.sql`、`migrations/004_group_monitoring.sql`。升级前备份数据库并停止旧索引器及 Python Web 服务。`004` 首次为所有旧 `tg_groups` 登记的群保留手动监听引用，不公开或授权；不再需要的旧群需在管理接口取消手动引用。迁移重复执行不会复活已停用群，也不会接管之后创建的仅归档群。镜像更新不自动执行迁移。
 
 未启用 Topics 的群若出现大量同名 `topic`，请参阅[普通回复误分类修复说明](docs/topic-repair.md)。此次修复不需要新的 SQL 结构迁移；备份后，将确认未使用 Topics 的群 ID 加入 `telegram.repair_non_forum_groups`，更新并重启索引器后会在初始化这些群时自动归并旧数据。
 

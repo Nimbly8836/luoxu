@@ -21,6 +21,7 @@ from telethon.tl.types import User  # type: ignore[import-not-found]
 
 from . import util
 from .auth import AuthService, Principal  # type: ignore[import-not-found]
+from .group import MonitoringUnavailable
 from .types import GroupNotFound, SearchQuery
 
 logger = logging.getLogger(__name__)
@@ -321,10 +322,12 @@ class ContextHandler(MessageHandler):
     config = request.app["context"]
     try:
       before = min(
-        _int(request.query.get("before", config["before"]), "before"), config["before"]
+        _int(request.query.get("before", config["before"]), "before"),
+        config["before"],
       )
       after = min(
-        _int(request.query.get("after", config["after"]), "after"), config["after"]
+        _int(request.query.get("after", config["after"]), "after"),
+        config["after"],
       )
       if before + after > config["max_window"]:
         raise web.HTTPBadRequest(text="context window is too large")
@@ -332,9 +335,16 @@ class ContextHandler(MessageHandler):
         _int(request.query.get("depth", config["reply_depth"]), "depth"),
         config["reply_depth"],
       )
+      reply_limit = min(
+        _int(
+          request.query.get("reply_limit", config["reply_limit"]),
+          "reply_limit",
+        ),
+        config["reply_limit"],
+      )
     except ValueError as exc:
       raise web.HTTPBadRequest from exc
-    if min(before, after, depth) < 0:
+    if min(before, after, depth, reply_limit) < 0:
       raise web.HTTPBadRequest
     context = await self.dbconn.get_context(
       cid,
@@ -343,15 +353,29 @@ class ContextHandler(MessageHandler):
       before,
       after,
       depth,
+      reply_limit,
     )
     if not context:
       raise web.HTTPNotFound
+    rows = [context["target"], *context["replies"]]
+    unavailable = sum(r.get("status") == "unavailable" for r in rows)
+    deleted = sum(bool(r.get("deleted_at")) for r in rows)
+    truncated = context.get("replies_truncated", False)
     return web.json_response(
       {
         "target": _message_json(context["target"]),
         "before": [_message_json(m) for m in context["before"]],
         "after": [_message_json(m) for m in context["after"]],
         "replies": [_message_json(m) for m in context["replies"]],
+        "replies_meta": {
+          "scope": "accessible_local_archive",
+          "complete": not (truncated or unavailable or deleted),
+          "truncated": truncated,
+          "unavailable_count": unavailable,
+          "deleted_count": deleted,
+          "depth": depth,
+          "limit": reply_limit,
+        },
       }
     )
 
@@ -467,8 +491,21 @@ async def require_admin(request):
 
 
 class AdminHandler:
-  def __init__(self, db, auth, add_group=None):
+  def __init__(
+    self, db, auth, add_group=None, monitoring_changed=None, monitoring_status=None
+  ):
     self.db, self.auth, self.group_adder = db, auth, add_group
+    self.monitoring_changed = monitoring_changed
+    self.monitoring_status = monitoring_status
+
+  async def _refresh_monitoring(self):
+    if self.monitoring_changed is not None:
+      try:
+        await self.monitoring_changed()
+      except Exception:
+        # The reference mutation is already committed. Periodic reconciliation
+        # retries it; a transient local worker error must not undo valid grants.
+        logger.exception("monitoring references saved; runtime refresh will retry")
 
   async def users(self, request):
     await require_admin(request)
@@ -482,17 +519,54 @@ class AdminHandler:
     return {row["id"] for row in rows}
 
   async def conversations(self, request):
+    return await self._conversation_list(request, monitored_only=False)
+
+  async def groups(self, request):
+    return await self._conversation_list(request, monitored_only=True)
+
+  async def _conversation_list(self, request, *, monitored_only):
     await require_admin(request)
-    rows = await self.db.list_all_conversations()
+    monitoring = await self.db.list_group_monitoring()
+    by_peer = {(r["telegram_peer_type"], r["telegram_peer_id"]): r for r in monitoring}
+    rows = monitoring if monitored_only else await self.db.list_all_conversations()
     public_ids = await self._public_conversation_ids()
+    runtime = self.monitoring_status() if self.monitoring_status else None
+    result = []
+    for row in rows:
+      state = by_peer.get((row["telegram_peer_type"], row["telegram_peer_id"]))
+      if monitored_only and (state is None or not state["reference_count"]):
+        continue
+      item = {**_conversation_json(row), "is_public": row["id"] in public_ids}
+      if state is not None:
+        default_state = "pending" if state["reference_count"] else "stopped"
+        item["monitoring"] = {
+          "requested": state["reference_count"] > 0,
+          "manual": state["manual_reference"],
+          "account_references": state["user_references"],
+          "public_references": state["public_references"],
+          "reference_count": state["reference_count"],
+          "runtime": runtime.get(
+            str(state["id"]), {"state": default_state, "error_type": None}
+          )
+          if runtime is not None
+          else {"state": "unknown", "error_type": None},
+        }
+      result.append(item)
     return web.json_response(
-      {
-        "conversations": [
-          {**_conversation_json(r), "is_public": r["id"] in public_ids} for r in rows
-        ]
-      },
+      {"groups" if monitored_only else "conversations": result},
       headers={"Cache-Control": "private, no-store"},
     )
+
+  async def manual_monitoring(self, request):
+    await require_admin(request)
+    found = await self.db.set_manual_monitoring(
+      _uuid(request.match_info["conversation_id"]),
+      request.method == "PUT",
+    )
+    if not found:
+      raise web.HTTPNotFound(text="group conversation not found")
+    await self._refresh_monitoring()
+    return web.Response(status=204)
 
   async def user_grants(self, request):
     await require_admin(request)
@@ -578,6 +652,7 @@ class AdminHandler:
       raise web.HTTPConflict(text=str(exc)) from exc
     if not found:
       raise web.HTTPNotFound
+    await self._refresh_monitoring()
     return web.Response(status=204)
 
   async def grant(self, request):
@@ -588,6 +663,7 @@ class AdminHandler:
       await self.db.grant_conversation(user_id, conversation_id)
     except ValueError as exc:
       raise web.HTTPNotFound(text=str(exc)) from exc
+    await self._refresh_monitoring()
     return web.Response(status=204)
 
   async def revoke(self, request):
@@ -596,6 +672,7 @@ class AdminHandler:
       _uuid(request.match_info["user_id"], "user id"),
       _uuid(request.match_info["conversation_id"]),
     )
+    await self._refresh_monitoring()
     return web.Response(status=204)
 
   async def public_grant(self, request):
@@ -604,6 +681,7 @@ class AdminHandler:
       await self.db.grant_public(_uuid(request.match_info["conversation_id"]))
     except ValueError as exc:
       raise web.HTTPBadRequest(text=str(exc)) from exc
+    await self._refresh_monitoring()
     return web.Response(status=204)
 
   async def add_group(self, request):
@@ -620,6 +698,8 @@ class AdminHandler:
       raise web.HTTPBadRequest(text="group is required")
     try:
       group = await self.group_adder(str(target).strip())
+    except MonitoringUnavailable as exc:
+      raise web.HTTPServiceUnavailable(text=str(exc)) from exc
     except (TypeError, ValueError) as exc:
       raise web.HTTPBadRequest(text="invalid group") from exc
     # The indexer returns legacy group state with history cursors, not a
@@ -642,6 +722,7 @@ class AdminHandler:
   async def public_revoke(self, request):
     await require_admin(request)
     await self.db.revoke_public(_uuid(request.match_info["conversation_id"]))
+    await self._refresh_monitoring()
     return web.Response(status=204)
 
   async def revoke_sessions(self, request):
@@ -847,6 +928,8 @@ def setup_app(
   history_enabled=False,
   context_config=None,
   add_group=None,
+  monitoring_changed=None,
+  monitoring_status=None,
 ):
   app = web.Application(middlewares=[cors_middleware, auth_middleware])
   app["origins"] = origins
@@ -857,6 +940,7 @@ def setup_app(
     "after": 5,
     "max_window": 20,
     "reply_depth": 5,
+    "reply_limit": 100,
     **(context_config or {}),
   }
   app.router.add_get(f"{prefix}/search", SearchHandler(dbconn).get)
@@ -881,7 +965,9 @@ def setup_app(
   app.router.add_post(f"{prefix}/auth/refresh", auth.refresh)
   app.router.add_get(f"{prefix}/auth/me", auth.me)
   app.router.add_post(f"{prefix}/auth/sessions/revoke", auth.revoke_sessions)
-  admin = AdminHandler(dbconn, auth_service, add_group)
+  admin = AdminHandler(
+    dbconn, auth_service, add_group, monitoring_changed, monitoring_status
+  )
   app.router.add_get(f"{prefix}/admin/users", admin.users)
   app.router.add_get(f"{prefix}/admin/conversations", admin.conversations)
   app.router.add_get(f"{prefix}/admin/users/{{user_id}}/grants", admin.user_grants)
@@ -896,6 +982,13 @@ def setup_app(
     f"{prefix}/admin/users/{{user_id}}/grants/{{conversation_id}}", admin.revoke
   )
   app.router.add_post(f"{prefix}/admin/groups", admin.add_group)
+  app.router.add_get(f"{prefix}/admin/groups", admin.groups)
+  app.router.add_put(
+    f"{prefix}/admin/groups/{{conversation_id}}", admin.manual_monitoring
+  )
+  app.router.add_delete(
+    f"{prefix}/admin/groups/{{conversation_id}}", admin.manual_monitoring
+  )
   app.router.add_post(f"{prefix}/admin/public/{{conversation_id}}", admin.public_grant)
   app.router.add_delete(
     f"{prefix}/admin/public/{{conversation_id}}", admin.public_revoke

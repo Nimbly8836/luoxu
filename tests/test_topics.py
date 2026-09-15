@@ -124,6 +124,8 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
     )
     async with self.db.get_conn() as conn:
       schema_sql = Path(__file__).resolve().parents[1] / "dbsetup.sql"
+      # Fixed repository DDL, never supplied by a request or external input.
+      # pi-lens-ignore: python-sql-injection
       await conn.execute(schema_sql.read_text())
       self.parent = await self.db.insert_group(conn, channel())
     self.parent_id = self.parent["conversation_uuid"]
@@ -157,7 +159,10 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
     edited=None,
     deleted=None,
     reply_to=None,
+    group_id: int | None = GROUP_ID,
   ):
+    # Literal test SQL; all variable values use separately bound $1-$9.
+    # pi-lens-ignore: python-sql-injection
     await conn.execute(
       """
       INSERT INTO messages (
@@ -168,7 +173,7 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
                 'quoted text', '{"type":"MessageMediaPhoto","id":123}'::jsonb)
       """,
       cid,
-      GROUP_ID,
+      group_id,
       msgid,
       topic_id,
       text,
@@ -339,6 +344,273 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
       auth_service=auth,
     )
     return TestClient(TestServer(app))
+
+  async def test_context_returns_full_thread_and_originals_outside_the_window(self):
+    async with self.db.get_conn() as conn:
+      await self.seed_message(
+        conn, self.parent_id, 1, text="<original question>", year=2022
+      )
+      await self.seed_message(
+        conn, self.parent_id, 2, text="earlier answer", year=2023, reply_to=1
+      )
+      await self.seed_message(
+        conn, self.parent_id, 50, text="selected message", year=2024, reply_to=2
+      )
+      await self.seed_message(
+        conn, self.parent_id, 20, text="parallel answer", year=2023, reply_to=1
+      )
+      await self.seed_message(
+        conn, self.parent_id, 70, text="later response", year=2025, reply_to=50
+      )
+      await self.seed_message(
+        conn, self.parent_id, 90, text="later follow-up", year=2026, reply_to=70
+      )
+      await self.seed_message(
+        conn,
+        self.parent_id,
+        60,
+        text="parallel follow-up",
+        year=2025,
+        reply_to=20,
+      )
+      await self.seed_message(
+        conn, self.parent_id, 999, text="unrelated chatter", year=2026
+      )
+    await self.db.grant_public(self.parent_id)
+    paths = [
+      f"/api/luoxu/context?g={GROUP_ID}&id=50&before=0&after=0",
+      f"/api/luoxu/conversations/{self.parent_id}/messages/50/context?before=0&after=0",
+    ]
+    async with self.api_client() as client:
+      results = []
+      for path in paths:
+        response = await client.get(path)
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertEqual(body["target"]["id"], 50)
+        self.assertEqual(body["before"], [])
+        self.assertEqual(body["after"], [])
+        originals = {m["id"]: m for m in body["replies"]}
+        self.assertEqual(set(originals), {1, 2, 20, 60, 70, 90})
+        self.assertEqual(originals[1]["text"], "<original question>")
+        self.assertEqual(originals[1]["html"], "&lt;original question&gt;")
+        self.assertEqual(originals[2]["text"], "earlier answer")
+        self.assertEqual(originals[20]["text"], "parallel answer")
+        self.assertEqual(originals[60]["text"], "parallel follow-up")
+        self.assertEqual(originals[70]["text"], "later response")
+        self.assertEqual(originals[90]["text"], "later follow-up")
+        self.assertEqual(originals[90]["reply_to_id"], 70)
+        self.assertEqual(response.headers["Cache-Control"], "private, no-store")
+        results.append(body)
+      self.assertEqual(results[0], results[1])
+
+  async def test_context_reports_reply_limits_instead_of_silent_truncation(self):
+    async with self.db.get_conn() as conn:
+      await self.seed_message(conn, self.parent_id, 1, reply_to=None)
+      await self.seed_message(conn, self.parent_id, 10, reply_to=1)
+      await self.seed_message(conn, self.parent_id, 20, reply_to=10)
+      await self.seed_message(conn, self.parent_id, 30, reply_to=20)
+      await self.seed_message(conn, self.parent_id, 40, reply_to=1)
+    await self.db.grant_public(self.parent_id)
+    paths = [
+      f"/api/luoxu/context?g={GROUP_ID}&id=10&before=0&after=0",
+      f"/api/luoxu/conversations/{self.parent_id}/messages/10/context?before=0&after=0",
+    ]
+    cases = [
+      ("", {1, 20, 30, 40}, False),
+      ("&reply_limit=2", {1, 20}, True),
+      ("&depth=1", {1, 20, 40}, True),
+      ("&depth=0", set(), True),
+      ("&reply_limit=0", set(), True),
+      ("&reply_limit=9999&depth=9999", {1, 20, 30, 40}, False),
+    ]
+    async with self.api_client() as client:
+      for path in paths:
+        for query, expected, truncated in cases:
+          with self.subTest(path=path, query=query):
+            response = await client.get(path + query)
+            self.assertEqual(response.status, 200)
+            body = await response.json()
+            self.assertEqual({m["id"] for m in body["replies"]}, expected)
+            meta = body["replies_meta"]
+            self.assertEqual(meta["scope"], "accessible_local_archive")
+            self.assertEqual(meta["truncated"], truncated)
+            self.assertEqual(meta["complete"], not truncated)
+            self.assertEqual(meta["unavailable_count"], 0)
+            self.assertEqual(meta["deleted_count"], 0)
+            self.assertLessEqual(meta["limit"], 100)
+            self.assertLessEqual(meta["depth"], 5)
+        for invalid in ("-1", "not-a-number"):
+          response = await client.get(path + "&reply_limit=" + invalid)
+          self.assertEqual(response.status, 400)
+
+  async def test_reply_thread_respects_topic_revocation_and_peer_identity(self):
+    async with self.db.get_conn() as conn:
+      selected_topic = await self.seed_topic(conn, 42)
+      parallel_topic = await self.seed_topic(conn, 44)
+      hidden_topic = await self.seed_topic(conn, 43)
+      private = await self.db._ensure_conversation(
+        conn, "private_chat", "user", GROUP_ID, "Private peer"
+      )
+      await self.seed_message(conn, self.parent_id, 1, text="original root")
+      await self.seed_message(conn, selected_topic, 10, topic_id=42, reply_to=1)
+      await self.seed_message(conn, selected_topic, 20, topic_id=42, reply_to=10)
+      await self.seed_message(
+        conn,
+        parallel_topic,
+        30,
+        topic_id=44,
+        reply_to=1,
+        text="parallel original",
+      )
+      await self.seed_message(conn, parallel_topic, 40, topic_id=44, reply_to=30)
+      await self.seed_message(
+        conn,
+        hidden_topic,
+        50,
+        topic_id=43,
+        reply_to=1,
+        text="SECRET-HIDDEN-BRANCH",
+      )
+      await self.seed_message(
+        conn,
+        hidden_topic,
+        60,
+        topic_id=43,
+        reply_to=10,
+        text="SECRET-HIDDEN-REPLY",
+      )
+      await self.seed_message(
+        conn, private["id"], 1, group_id=None, text="PRIVATE-NOT-THE-GROUP-ROOT"
+      )
+      await self.seed_message(
+        conn,
+        private["id"],
+        80,
+        group_id=None,
+        reply_to=10,
+        text="PRIVATE-NOT-A-GROUP-REPLY",
+      )
+    auth = AuthService({"jwt_secret": AuthService.random_secret()})
+    user = await self.db.create_user("thread_reader", "unused-test-hash")
+    admin = await self.db.create_user("thread_admin", "unused-test-hash", True)
+    for cid in (selected_topic, parallel_topic, private["id"]):
+      await self.db.grant_conversation(user["id"], cid)
+    headers = {"Authorization": "Bearer " + auth.access_token(user)}
+    admin_headers = {"Authorization": "Bearer " + auth.access_token(admin)}
+    paths = [
+      f"/api/luoxu/context?g={GROUP_ID}&id=10&before=0&after=0",
+      f"/api/luoxu/conversations/{selected_topic}/messages/10/context?before=0&after=0",
+    ]
+    async with self.api_client(auth) as client:
+      for path in paths:
+        for denied_headers in ({}, admin_headers):
+          response = await client.get(path, headers=denied_headers)
+          self.assertEqual(response.status, 404)
+        response = await client.get(path, headers=headers)
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertEqual(body["replies"][0], {"msgid": 1, "status": "unavailable"})
+        self.assertEqual({m["id"] for m in body["replies"] if "id" in m}, {20, 30, 40})
+        self.assertFalse(body["replies_meta"]["complete"])
+        self.assertEqual(body["replies_meta"]["unavailable_count"], 1)
+        self.assertNotIn("SECRET-", str(body))
+        self.assertNotIn("PRIVATE-NOT", str(body))
+      await self.db.revoke_conversation(user["id"], parallel_topic)
+      for path in paths:
+        response = await client.get(path, headers=headers)
+        body = await response.json()
+        self.assertEqual({m["id"] for m in body["replies"] if "id" in m}, {20})
+      await self.db.grant_conversation(user["id"], self.parent_id)
+      for path in paths:
+        response = await client.get(path, headers=headers)
+        body = await response.json()
+        self.assertEqual({m["id"] for m in body["replies"]}, {1, 20, 30, 40, 50, 60})
+        self.assertEqual(body["replies"][0]["text"], "original root")
+        self.assertTrue(body["replies_meta"]["complete"])
+        self.assertNotIn("PRIVATE-NOT", str(body))
+      await self.db.revoke_conversation(user["id"], self.parent_id)
+      await self.db.revoke_conversation(user["id"], selected_topic)
+      for path in paths:
+        response = await client.get(path, headers=headers)
+        self.assertEqual(response.status, 404)
+
+  async def test_reply_thread_marks_missing_and_deleted_originals_without_fabricating_text(
+    self,
+  ):
+    async with self.db.get_conn() as conn:
+      await self.seed_message(
+        conn,
+        self.parent_id,
+        20,
+        text="DELETED-ORIGINAL-SECRET",
+        reply_to=777,
+        deleted=datetime.datetime(2025, 2, 1, tzinfo=UTC),
+      )
+      await self.seed_message(conn, self.parent_id, 10, text="selected", reply_to=20)
+      await self.seed_message(
+        conn, self.parent_id, 30, text="reply to deleted original", reply_to=20
+      )
+      await self.seed_message(
+        conn, self.parent_id, 40, text="reply to missing original", reply_to=777
+      )
+    await self.db.grant_public(self.parent_id)
+    paths = [
+      f"/api/luoxu/context?g={GROUP_ID}&id=10&before=0&after=0",
+      f"/api/luoxu/conversations/{self.parent_id}/messages/10/context?before=0&after=0",
+    ]
+    async with self.api_client() as client:
+      for path in paths:
+        response = await client.get(path)
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        originals = {m["id"]: m for m in body["replies"] if "id" in m}
+        self.assertEqual(set(originals), {20, 30, 40})
+        self.assertTrue(originals[20]["deleted"])
+        self.assertIsNone(originals[20]["text"])
+        self.assertIsNone(originals[20]["html"])
+        self.assertEqual(originals[30]["text"], "reply to deleted original")
+        self.assertEqual(originals[40]["text"], "reply to missing original")
+        self.assertIn({"msgid": 777, "status": "unavailable"}, body["replies"])
+        self.assertNotIn("DELETED-ORIGINAL-SECRET", str(body))
+        self.assertFalse(body["replies_meta"]["complete"])
+        self.assertFalse(body["replies_meta"]["truncated"])
+        self.assertEqual(body["replies_meta"]["unavailable_count"], 1)
+        self.assertEqual(body["replies_meta"]["deleted_count"], 1)
+
+  async def test_reply_thread_deduplicates_cross_year_rows_and_terminates_cycles(
+    self,
+  ):
+    async with self.db.get_conn() as conn:
+      await self.seed_message(conn, self.parent_id, 1, reply_to=10)
+      await self.seed_message(conn, self.parent_id, 10, reply_to=1)
+      await self.seed_message(
+        conn, self.parent_id, 20, reply_to=10, year=2025, text="old duplicate"
+      )
+      await self.seed_message(
+        conn,
+        self.parent_id,
+        20,
+        reply_to=10,
+        year=2026,
+        text="current original",
+      )
+      await self.seed_message(conn, self.parent_id, 30, reply_to=20)
+    await self.db.grant_public(self.parent_id)
+    paths = [
+      f"/api/luoxu/context?g={GROUP_ID}&id=10&before=0&after=0&depth=2&reply_limit=3",
+      f"/api/luoxu/conversations/{self.parent_id}/messages/10/context?before=0&after=0&depth=2&reply_limit=3",
+    ]
+    async with self.api_client() as client:
+      for path in paths:
+        async with asyncio.timeout(2):
+          response = await client.get(path)
+          self.assertEqual(response.status, 200)
+          body = await response.json()
+        self.assertEqual([m["id"] for m in body["replies"]], [1, 20, 30])
+        self.assertEqual(body["replies"][1]["text"], "current original")
+        self.assertTrue(body["replies_meta"]["complete"])
+        self.assertFalse(body["replies_meta"]["truncated"])
 
   async def test_legacy_context_url_matches_uuid_context(self):
     async with self.db.get_conn() as conn:

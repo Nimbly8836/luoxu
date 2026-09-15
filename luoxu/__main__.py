@@ -1,22 +1,21 @@
 import asyncio
-import contextlib
 import importlib
 import inspect
 import logging
-import operator
 import os
 import re
-from functools import partial
 from typing import Any, cast
 
 from aiohttp import web  # type: ignore[import-not-found]
 from telethon import events, utils  # type: ignore[import-not-found]
+from telethon.errors import RPCError
+from telethon.tl import types
 
 from . import web as myweb
 from .auth import AuthService  # type: ignore[import-not-found]
 from .ctxvars import msg_source
 from .db import PostgreStore
-from .group import GroupHistoryIndexer, PrivateHistoryIndexer
+from .group import GroupMonitor, MonitoringUnavailable, PrivateHistoryIndexer
 from .util import UpdateLoaded, create_client, load_config, run_until_sigint
 
 logger = logging.getLogger(__name__)
@@ -38,6 +37,8 @@ class Indexer:
     self.indexed_private_ids = set()
     self.ocr_ignore_group_ids = set()
     self.group_forward_history_done = {}
+    self._monitor: GroupMonitor | None = None
+    self._monitor_lock = asyncio.Lock()
 
   async def load_plugins(self, client):
     for plugin, conf in self.config.get("plugin", {}).items():
@@ -122,6 +123,8 @@ class Indexer:
       history_enabled=history_enabled,
       context_config=web_config.get("context"),
       add_group=self.add_group,
+      monitoring_changed=self.sync_monitoring,
+      monitoring_status=self.monitoring_status,
     )
     runner = web.AppRunner(app)
     await runner.setup()
@@ -133,29 +136,23 @@ class Indexer:
     await site.start()
 
     await _start_client(client, tg_config["account"])
-    ocr_ignore_group_ids = []
-    group_entities = []
+    self.client = client
+    await self.import_group_config()
+    ignored = {str(g) for g in tg_config.get("ocr_ignore_groups", ())}
+    for row in await db.list_group_monitoring():
+      peer_cls = (
+        types.PeerChat if row["telegram_peer_type"] == "chat" else types.PeerChannel
+      )
+      references = {
+        str(row["telegram_peer_id"]),
+        str(utils.get_peer_id(peer_cls(row["telegram_peer_id"]))),
+        "@" + (row["pub_id"] or ""),
+        row["pub_id"],
+      }
+      if references & ignored:
+        self.ocr_ignore_group_ids.add(row["telegram_peer_id"])
+
     private_entities = []
-    dialogs = None
-    for g in tg_config["index_groups"]:
-      g = str(g)
-      if g.startswith("@"):
-        group = cast(Any, await client.get_entity(g))
-      else:
-        g2 = 0
-        try:
-          g2 = int(g)
-          group = cast(Any, await client.get_entity(g2))
-        except ValueError:
-          if dialogs is None:
-            dialogs = await client.get_dialogs()
-          group = next(d.entity for d in dialogs if d.entity.id == g2)
-
-      if g in tg_config.get("ocr_ignore_groups", ()):
-        ocr_ignore_group_ids.append(group.id)
-
-      group_entities.append(group)
-
     for private in tg_config.get("index_private_chats", ()):
       try:
         target = private if str(private).startswith("@") else int(private)
@@ -166,23 +163,25 @@ class Indexer:
       private_entities.append(entity)
       self.indexed_private_ids.add(entity.id)
 
-    self.ocr_ignore_group_ids = ocr_ignore_group_ids
-    self.client = client
-    indexed_entities = group_entities + private_entities
-    client.add_event_handler(self.on_message, events.NewMessage(chats=indexed_entities))
-    client.add_event_handler(
-      self.on_message, events.MessageEdited(chats=indexed_entities)
-    )
-    client.add_event_handler(
-      self.on_deleted, events.MessageDeleted(chats=indexed_entities)
-    )
+    # Group callbacks belong to GroupMonitor so they can be removed on the
+    # last-reference transition. Private chats still require explicit config.
+    if private_entities:
+      client.add_event_handler(
+        self.on_message, events.NewMessage(chats=private_entities)
+      )
+      client.add_event_handler(
+        self.on_message, events.MessageEdited(chats=private_entities)
+      )
+      client.add_event_handler(
+        self.on_deleted, events.MessageDeleted(chats=private_entities)
+      )
 
     await self.load_plugins(client)
 
     try:
       while True:
         try:
-          await self.run_on_connected(client, db, group_entities)
+          await self.run_on_connected(client, db)
           logger.warning("disconnected, reconnecting in 1s")
           await asyncio.sleep(1)
         except (
@@ -197,6 +196,8 @@ class Indexer:
             await asyncio.sleep(5)
     finally:
       await runner.cleanup()
+      await self.close_group_monitoring()
+      await db.close()
 
   async def on_deleted(self, event):
     chat_id = getattr(event, "chat_id", None)
@@ -219,79 +220,133 @@ class Indexer:
       peer_type=peer_type,
     )
 
-  async def run_on_connected(self, client, db, group_entities):
-    self.group_forward_history_done = {}
-    runnables = []
-    for group in group_entities:
-      ginfo = await self.init_group(group)
-      use_ocr = group.id not in self.ocr_ignore_group_ids
-      gi = GroupHistoryIndexer(group, ginfo, use_ocr)
-      runnables.append(
-        gi.run(
-          client,
-          db,
-          partial(operator.setitem, self.group_forward_history_done, group.id, True),
-        )
-      )
+  async def run_on_connected(self, client, db, group_entities=None):
+    # The old group_entities argument is not authoritative after initial import.
+    if not client.is_connected():
+      await _start_client(client, self.config["telegram"]["account"])
+      logger.info("resetting client._sender._ping")
+      client._sender._ping = None
     web_config = self.config["web"]
     await db.bootstrap(
       web_config["auth"],
       web_config.get("public_groups", ()),
       AuthService(web_config["auth"]),
     )
-    for private_id in self.indexed_private_ids:
-      entity = await client.get_entity(private_id)
-      runnables.append(PrivateHistoryIndexer(entity, True).run(client, db))
-
-    if not client.is_connected():
-      await _start_client(client, self.config["telegram"]["account"])
-      # reset last ping to avoid reconnecting every 60s
-      logger.info("resetting client._sender._ping")
-      client._sender._ping = None
-
-    # we do need to fetch history on startup because telethon doesn't
-    # record group's pts in database.
-    #
-    # we also need to fetch history on reconnect because sometimes we still
-    # don't see some missed updates (I don't know why).
-    #
-    # we may still miss edits that happen while we're offline and missed
-    # the updates.
-    gis = asyncio.gather(*runnables)
-    # await client.catch_up()
+    await self.sync_monitoring()
+    monitor = self._monitor
+    if monitor is None:
+      raise MonitoringUnavailable("Telegram client is not connected")
+    watcher = asyncio.create_task(monitor.run(), name="group-monitoring-refresh")
+    runnables = []
     try:
+      for private_id in self.indexed_private_ids:
+        entity = await client.get_entity(private_id)
+        runnables.append(
+          asyncio.create_task(PrivateHistoryIndexer(entity, True).run(client, db))
+        )
+      # Reconnect starts fresh workers, which resume from archived cursors.
+      # As before, Telegram cannot reconstruct edits missed while offline.
       await client.run_until_disconnected()
     finally:
-      gis.cancel()
-      with contextlib.suppress(asyncio.CancelledError):
-        await gis
+      watcher.cancel()
+      for task in runnables:
+        task.cancel()
+      await asyncio.gather(watcher, *runnables, return_exceptions=True)
+      await self.close_group_monitoring()
 
-  async def add_group(self, target):
-    if self.client is None or self.dbstore is None:
-      raise RuntimeError("Telegram client is not ready")
+  async def resolve_group(self, target):
+    if self.client is None:
+      raise MonitoringUnavailable("Telegram client is not ready")
+    target = str(target).strip()
+    number = None
+    if target.lstrip("-").isdigit():
+      try:
+        number = int(target)
+      except ValueError as exc:
+        raise ValueError("invalid group ID") from exc
+      if number == 0 or not -(2**63) <= number < 2**63:
+        raise ValueError("group ID must be a nonzero signed 64-bit integer")
     try:
       entity = cast(
         Any,
-        await self.client.get_entity(
-          target if not target.lstrip("-").isdigit() else int(target)
-        ),
+        await self.client.get_entity(number if number is not None else target),
       )
-    except Exception as exc:
+    except ValueError:
+      if number is None:
+        raise
+      entity = None
+    if isinstance(entity, (types.Chat, types.Channel)):
+      return entity
+    if number is not None:
+      peer_id, peer_cls = utils.resolve_id(number)
+      expected = {
+        types.PeerChat: types.Chat,
+        types.PeerChannel: types.Channel,
+      }.get(peer_cls)
+      for dialog in await self.client.get_dialogs():
+        entity = dialog.entity
+        if (
+          isinstance(entity, (types.Chat, types.Channel))
+          and entity.id == peer_id
+          and (expected is None or isinstance(entity, expected))
+        ):
+          return entity
+    raise ValueError("target is not an accessible group")
+
+  async def import_group_config(self):
+    if self.dbstore is None:
+      raise MonitoringUnavailable("database is not ready")
+    if await self.dbstore.monitoring_config_imported():
+      return
+    groups = [
+      await self.resolve_group(g)
+      for g in self.config["telegram"].get("index_groups", ())
+    ]
+    await self.dbstore.import_monitoring_config(groups)
+
+  def _group_monitor(self) -> GroupMonitor:
+    monitor = self._monitor
+    if monitor is None:
+      monitor = GroupMonitor(self)
+      self._monitor = monitor
+    return monitor
+
+  async def sync_monitoring(self, *, prime=None):
+    async with self._monitor_lock:
+      if (
+        self.dbstore is not None
+        and self.client is not None
+        and self.client.is_connected()
+      ):
+        monitor = self._group_monitor()
+        if prime is not None:
+          monitor.prime(*prime)
+        await monitor.reconcile()
+
+  def monitoring_status(self):
+    return self._monitor.statuses() if self._monitor else {}
+
+  async def close_group_monitoring(self):
+    async with self._monitor_lock:
+      monitor, self._monitor = self._monitor, None
+      if monitor is not None:
+        await monitor.close()
+
+  async def add_group(self, target):
+    if self.client is None or self.dbstore is None:
+      raise MonitoringUnavailable("Telegram client is not ready")
+    try:
+      entity = await self.resolve_group(target)
+    except (ValueError, TypeError, RPCError) as exc:
       raise ValueError("group not found") from exc
-    if entity.id in self.group_forward_history_done:
-      async with self.dbstore.get_conn() as conn:
-        return await self.dbstore.get_group(conn, entity.id)
-    info = await self.init_group(entity)
-    self.group_forward_history_done[entity.id] = False
-    self.client.add_event_handler(self.on_message, events.NewMessage(chats=[entity]))
-    self.client.add_event_handler(self.on_message, events.MessageEdited(chats=[entity]))
-    asyncio.create_task(
-      GroupHistoryIndexer(entity, info, entity.id not in self.ocr_ignore_group_ids).run(
-        self.client,
-        self.dbstore,
-        partial(operator.setitem, self.group_forward_history_done, entity.id, True),
-      )
-    )
+    except ConnectionError as exc:
+      raise MonitoringUnavailable("Telegram client is not connected") from exc
+    info = await self.dbstore.add_monitored_group(entity)
+    if str(target) in {
+      str(g) for g in self.config["telegram"].get("ocr_ignore_groups", ())
+    }:
+      self.ocr_ignore_group_ids.add(entity.id)
+    await self.sync_monitoring(prime=(info, entity))
     return info
 
   async def init_group(self, group):

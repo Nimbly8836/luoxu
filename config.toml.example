@@ -6,6 +6,8 @@ account = "+1234567890"
 # system_version = "6.8.1"
 # app_version = "telethon 1.34.0"
 session_db = "mybot"
+# Imported into durable manual references ONCE. After that manage monitoring
+# through /admin/groups; stale configuration cannot re-enable removed references.
 index_groups = [
   "@group1",
   "@group2",
@@ -62,7 +64,11 @@ password_hash = "$argon2id$v=19$..."
 before = 5
 after = 5
 max_window = 20
+# Ancestor hops, then descendant layers from the target and ancestor spine.
 reply_depth = 5
+# Maximum additional thread messages, including unavailable placeholders.
+# Inspect replies_meta for explicit truncation/missing-original indicators.
+reply_limit = 100
 
 [web.message_history]
 # Privacy-sensitive feature; no snapshots are captured while false.

@@ -144,6 +144,17 @@ CREATE TABLE bootstrap_state (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- Manual indexing references, independent of public/user read permissions.
+-- Keep disabled rows as tombstones so configuration import cannot resurrect them.
+CREATE TABLE group_monitoring (
+  conversation_id uuid PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+  manual_enabled boolean NOT NULL DEFAULT true,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+-- Fresh installs have no legacy archives to adopt. Replaying upgrade 004 later
+-- must not opt newer archive-only groups into monitoring.
+INSERT INTO bootstrap_state (name) VALUES ('group-monitoring-legacy-v1');
+
 CREATE TABLE message_revisions (
   id bigserial PRIMARY KEY,
   conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -165,4 +176,5 @@ CREATE INDEX message_revisions_lookup_idx
   ON message_revisions (conversation_id, msgid, captured_at DESC);
 
 -- Existing installations must run migrations/001_access_control.sql,
--- migrations/002_conversations.sql and migrations/003_message_history.sql.
+-- migrations/002_conversations.sql, migrations/003_message_history.sql,
+-- and migrations/004_group_monitoring.sql.

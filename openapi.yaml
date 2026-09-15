@@ -150,8 +150,13 @@ paths:
       description: >-
         Compatibility entry point for group messages, including forum topics.
         Resolves the locally archived message and applies access control to its
-        actual conversation. Returns the same target, before, after, and replies
-        fields as the UUID context endpoint. Never fetches from Telegram.
+        actual conversation. Returns the same target, before, after, replies,
+        and replies_meta as the UUID endpoint. Replies include full archived
+        originals, later replies and parallel branches rooted at earlier
+        originals, independently of search hits and the chronological window.
+        Only authorized local messages on the same Telegram peer are traversed;
+        never fetches from Telegram. Completeness is local, not a claim about
+        Telegram history.
       parameters:
         - name: g
           in: query
@@ -167,57 +172,39 @@ paths:
             type: integer
             format: int64
             minimum: 1
-        - name: before
-          in: query
-          description: Bounded by the configured context.before limit.
-          schema:
-            type: integer
-            minimum: 0
-            default: 5
-        - name: after
-          in: query
-          description: Bounded by the configured context.after limit.
-          schema:
-            type: integer
-            minimum: 0
-            default: 5
-        - name: depth
-          in: query
-          description: Bounded by the configured context.reply_depth limit.
-          schema:
-            type: integer
-            minimum: 0
-            default: 5
+        - $ref: '#/components/parameters/context_before'
+        - $ref: '#/components/parameters/context_after'
+        - $ref: '#/components/parameters/reply_depth'
+        - $ref: '#/components/parameters/reply_limit'
       responses:
         '200':
-          description: Message context with a bounded reply chain
+          $ref: '#/components/responses/MessageContext'
         '400':
           description: Missing or invalid query parameters
         '404':
           description: Message not locally archived or not accessible
   /conversations/{conversation_id}/messages/{message_id}/context:
     get:
-      summary: Get surrounding messages and reply chain
+      summary: Get surrounding messages and the accessible local discussion
+      description: >-
+        Same behavior as the legacy context endpoint. Walks earlier originals,
+        then expands descendants from the target and ancestor spine, including
+        parallel branches. Full archived originals need not match a search or
+        occur in the before/after window. Uses current permissions, never
+        Telegram.
+        Check replies_meta for truncation and unavailable or deleted content.
       parameters:
         - $ref: '#/components/parameters/conversation_id'
         - $ref: '#/components/parameters/message_id'
-        - name: before
-          in: query
-          schema:
-            type: integer
-            minimum: 0
-            maximum: 5
-            default: 5
-        - name: after
-          in: query
-          schema:
-            type: integer
-            minimum: 0
-            maximum: 5
-            default: 5
+        - $ref: '#/components/parameters/context_before'
+        - $ref: '#/components/parameters/context_after'
+        - $ref: '#/components/parameters/reply_depth'
+        - $ref: '#/components/parameters/reply_limit'
       responses:
         '200':
-          description: Message context with a bounded reply chain
+          $ref: '#/components/responses/MessageContext'
+        '400':
+          description: Invalid parameters or excessive combined window
         '404':
           description: Not found or not accessible
   /conversations/{conversation_id}/messages/{message_id}/history:
@@ -298,15 +285,43 @@ paths:
         '200':
           description: Avatar image
   /admin/groups:
+    get:
+      summary: List canonical groups with positive monitoring references
+      description: >-
+        Administrator only. Persisted requested monitoring, not a guarantee that
+        Telegram collection is running. Runtime is local; web-only reports
+        unknown. The all-archive list remains /admin/conversations.
+        Response is private, no-store.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Groups with one or more manual/account/public references
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [groups]
+                properties:
+                  groups:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AdminConversation'
+        '401':
+          description: Authentication required
+        '403':
+          description: Administrator required
     post:
       summary: Start monitoring a group or return an already monitored group
       description: >-
         Administrator only. Monitoring does not publish the archive or grant
         user access. Returns the canonical conversation UUID for later grants.
         Requires a running indexer with the group-monitoring callback; web-only
-        mode returns 503. Dynamic monitoring is process-local; after a restart,
-        configure telegram.index_groups or add the group again. Stored archives
-        and access grants persist.
+        mode returns 503. Saves a durable manual reference and reuses the
+        existing archive on re-enable. Restarts restore persisted references.
+        Configuration
+        telegram.index_groups is imported only once and cannot resurrect stopped
+        manual references. Collection failures retain requested state for retry.
       security:
         - bearerAuth: []
       requestBody:
@@ -344,6 +359,48 @@ paths:
           description: Administrator required
         '503':
           description: Monitoring or conversation metadata is unavailable
+  /admin/groups/{conversation_id}:
+    parameters:
+      - $ref: '#/components/parameters/conversation_id'
+    put:
+      summary: Enable the manual monitoring reference for an archived group
+      description: >-
+        Does not grant or publish content. Canonical parent group UUID only.
+        Web-only can persist this change; a running indexer reconciles it later.
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Manual reference enabled idempotently
+        '400':
+          description: Invalid UUID
+        '401':
+          description: Authentication required
+        '403':
+          description: Administrator required
+        '404':
+          description: Canonical group not found
+    delete:
+      summary: Disable only the manual monitoring reference
+      description: >-
+        Individual and public grants on the group or its topics continue to keep
+        collection requested. Last-reference removal stops live handlers/history
+        but retains messages, revisions, UUID and saved history progress.
+        Does not revoke access grants. Web-only changes are reconciled
+        by an indexer.
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Manual reference disabled idempotently
+        '400':
+          description: Invalid UUID
+        '401':
+          description: Authentication required
+        '403':
+          description: Administrator required
+        '404':
+          description: Canonical group not found
   /admin/conversations:
     get:
       summary: List all conversations for permission management
@@ -351,6 +408,8 @@ paths:
         Management list, not the current user's content access list. is_public
         reflects effective anonymous access, including inherited public topics.
         Telegram pub_id is a username and must not be used as an access flag.
+        Includes stopped archives. Groups and topics report their underlying
+        group's references and local runtime; private chats omit monitoring.
       security:
         - bearerAuth: []
       responses:
@@ -523,7 +582,129 @@ paths:
         '204':
           description: Revoked
 components:
+  responses:
+    MessageContext:
+      description: Bounded local discussion with explicit completeness metadata
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MessageContext'
   schemas:
+    ArchivedMessage:
+      type: object
+      required: [conversation_id, id, text, html, deleted, reply_to_id]
+      properties:
+        conversation_id: {type: string, format: uuid}
+        id: {type: integer, format: int64}
+        text:
+          type: [string, 'null']
+          description: >-
+            Full archived text, not just the quoted excerpt; null if deleted
+        html: {type: [string, 'null']}
+        deleted: {type: boolean}
+        reply_to_id: {type: [integer, 'null'], format: int64}
+        quote_text: {type: [string, 'null']}
+    UnavailableReply:
+      type: object
+      additionalProperties: false
+      required: [msgid, status]
+      properties:
+        msgid: {type: integer, format: int64}
+        status: {type: string, enum: [unavailable]}
+    RepliesMeta:
+      type: object
+      required:
+        - scope
+        - complete
+        - truncated
+        - unavailable_count
+        - deleted_count
+        - depth
+        - limit
+      properties:
+        scope: {type: string, enum: [accessible_local_archive]}
+        complete:
+          type: boolean
+          description: >-
+            No truncation, unavailable placeholders or deleted content in target
+            plus replies. Never asserts completeness of Telegram history.
+        truncated:
+          type: boolean
+          description: >-
+            Limits omitted a known reference or accessible branch.
+            Hidden branches are not counted or disclosed.
+        unavailable_count: {type: integer, minimum: 0}
+        deleted_count:
+          type: integer
+          minimum: 0
+          description: >-
+            Counts target plus replies, not unrelated before/after neighbors
+        depth: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 0}
+    MessageContext:
+      type: object
+      required: [target, before, after, replies, replies_meta]
+      properties:
+        target:
+          $ref: '#/components/schemas/ArchivedMessage'
+        before:
+          type: array
+          items:
+            $ref: '#/components/schemas/ArchivedMessage'
+        after:
+          type: array
+          items:
+            $ref: '#/components/schemas/ArchivedMessage'
+        replies:
+          type: array
+          description: >-
+            Ancestors nearest-to-oldest, then descendants breadth-first by ID
+            from the target and ancestor spine. Includes parallel branches;
+            target excluded and IDs deduplicated. Build trees using reply_to_id.
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/ArchivedMessage'
+              - $ref: '#/components/schemas/UnavailableReply'
+        replies_meta:
+          $ref: '#/components/schemas/RepliesMeta'
+    GroupMonitoring:
+      type: object
+      required:
+        - requested
+        - manual
+        - account_references
+        - public_references
+        - reference_count
+        - runtime
+      properties:
+        requested: {type: boolean}
+        manual: {type: boolean}
+        account_references:
+          type: integer
+          minimum: 0
+          description: Explicit grant edges on group/topics, not distinct users
+        public_references: {type: integer, minimum: 0}
+        reference_count:
+          type: integer
+          minimum: 0
+          description: Manual (0 or 1) plus account and public references
+        runtime:
+          type: object
+          required: [state, error_type]
+          properties:
+            state:
+              type: string
+              enum:
+                - unknown
+                - pending
+                - starting
+                - running
+                - retrying
+                - stopping
+                - stopped
+              description: >-
+                Local observation; running does not mean history is complete
+            error_type: {type: [string, 'null']}
     AdminConversation:
       type: object
       required:
@@ -537,6 +718,8 @@ components:
         - legacy_group_id
         - is_public
       properties:
+        monitoring:
+          $ref: '#/components/schemas/GroupMonitoring'
         id:
           type: string
           format: uuid
@@ -568,6 +751,33 @@ components:
           description: >-
             Effective anonymous access, including inherited public group topics
   parameters:
+    context_before:
+      name: before
+      in: query
+      description: >-
+        Clamped to context.before; combined window is bounded by max_window.
+      schema: {type: integer, minimum: 0, default: 5}
+    context_after:
+      name: after
+      in: query
+      description: >-
+        Clamped to context.after; these are neighbors, not necessarily replies.
+      schema: {type: integer, minimum: 0, default: 5}
+    reply_depth:
+      name: depth
+      in: query
+      description: >-
+        Clamped to context.reply_depth. Ancestor hops, then descendant layers
+        from the target and ancestor spine, not a shared graph-distance budget.
+      schema: {type: integer, minimum: 0, default: 5}
+    reply_limit:
+      name: reply_limit
+      in: query
+      description: >-
+        Clamped to context.reply_limit. Maximum replies including unavailable
+        placeholders; excludes target and chronological neighbors.
+        Zero is allowed.
+      schema: {type: integer, minimum: 0, default: 100}
     user_id:
       name: user_id
       in: path

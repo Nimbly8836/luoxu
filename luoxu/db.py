@@ -182,6 +182,8 @@ class PostgreStore:
     row = await self._get_conversation(conn, kind, peer_type, peer_id, topic_id)
     if row:
       if name and row["name"] != name:
+        # Literal SQL; both name and UUID are separately bound as $1/$2.
+        # pi-lens-ignore: python-sql-injection
         await conn.execute(
           "UPDATE conversations SET name = $1 WHERE id = $2",
           name,
@@ -311,6 +313,8 @@ class PostgreStore:
     for topic_id in topic_ids:
       await self._merge_topic_messages(conn, parent_id, topic_id, group.id)
     # Preserve previously captured revisions even if collection is now disabled.
+    # Literal SQL; parent ID and topic IDs are separately bound as $1/$2.
+    # pi-lens-ignore: python-sql-injection
     await conn.execute(
       """
       UPDATE message_revisions SET conversation_id = $1, topic_id = NULL
@@ -321,6 +325,8 @@ class PostgreStore:
     )
     # FK cascades remove grants on invalid IDs. Never promote them to group
     # grants: that would silently widen a topic-only user's or pub's access.
+    # Literal SQL; the UUID array is separately bound as $1.
+    # pi-lens-ignore: python-sql-injection
     await conn.execute(
       "DELETE FROM conversations WHERE id = ANY($1::uuid[])",
       topic_ids,
@@ -337,6 +343,8 @@ class PostgreStore:
     # Move atomically, including yearly partitions. Replayed duplicates may
     # already exist in the parent; retain the latest state and never resurrect
     # a deletion. This repair does not create new historical snapshots.
+    # Literal CTE; all variable IDs are separately bound as $1/$2/$3.
+    # pi-lens-ignore: python-sql-injection
     await conn.execute(
       """
       WITH moved AS (
@@ -377,6 +385,8 @@ class PostgreStore:
       sql = "UPDATE tg_groups SET loaded_first_id = $1 WHERE group_id = $2"
     else:
       raise ValueError(direction)
+    # sql is one of the two literal statements above; values use $1/$2.
+    # pi-lens-ignore: python-sql-injection
     await conn.execute(sql, msgid, group_id)
 
   @staticmethod
@@ -554,7 +564,10 @@ class PostgreStore:
       ]
       for msg, text, conversation in data:
         await self._insert_one_message(conn, msg, text, conversation)
-      if data and update_loaded in (UpdateLoaded.update_last, UpdateLoaded.update_both):
+      if data and update_loaded in (
+        UpdateLoaded.update_last,
+        UpdateLoaded.update_both,
+      ):
         first = data[-1][2]["legacy_group_id"]
         if first:
           await self.loaded_upto(conn, first, 1, formatted[-1][0].id)
@@ -836,8 +849,117 @@ class PostgreStore:
         allowed or [],
       )
 
+  async def _reply_candidates(
+    self, conn, peer_ids, ids, seen, preferred, limit, *, children
+  ):
+    # Separate predicates keep both paths indexable, even with a generic prepared
+    # plan. All message bodies are restricted to authorized conversations first.
+    if children:
+      sql = """
+        SELECT DISTINCT ON (msgid) * FROM messages
+        WHERE conversation_id = ANY($1::uuid[]) AND reply_to_id = ANY($2::bigint[])
+          AND NOT (msgid = ANY($3::bigint[]))
+        ORDER BY msgid, (conversation_id = $4) DESC, created_at DESC, conversation_id
+        LIMIT $5
+      """
+    else:
+      sql = """
+        SELECT DISTINCT ON (msgid) * FROM messages
+        WHERE conversation_id = ANY($1::uuid[]) AND msgid = ANY($2::bigint[])
+          AND NOT (msgid = ANY($3::bigint[]))
+        ORDER BY msgid, (conversation_id = $4) DESC, created_at DESC, conversation_id
+        LIMIT $5
+      """
+    return await conn.fetch(sql, peer_ids, ids, list(seen), preferred, limit)
+
+  async def _reply_thread(self, conn, target, allowed, depth, limit):
+    peers = await conn.fetch(
+      """
+      SELECT c.id FROM conversations c JOIN conversations target ON target.id = $1
+      WHERE c.telegram_peer_type = target.telegram_peer_type
+        AND c.telegram_peer_id = target.telegram_peer_id
+        AND c.id = ANY($2::uuid[])
+    """,
+      target["conversation_id"],
+      allowed or [],
+    )
+    peer_ids = [r["id"] for r in peers]
+    preferred = target["conversation_id"]
+    seen = {target["msgid"]}
+    result = []
+    current = target
+    # Keep the old nearest-to-oldest ancestor ordering. Every reachable original
+    # is loaded independently of search matches and the chronological window.
+    for _ in range(min(depth, limit)):
+      reply_id = current.get("reply_to_id")
+      if not reply_id or reply_id in seen:
+        break
+      rows = await self._reply_candidates(
+        conn,
+        peer_ids,
+        [reply_id],
+        seen,
+        preferred,
+        1,
+        children=False,
+      )
+      current = rows[0] if rows else {"msgid": reply_id, "status": "unavailable"}
+      result.append(current)
+      seen.add(reply_id)
+    truncated = bool(current.get("reply_to_id") and current["reply_to_id"] not in seen)
+
+    # Expand from the entire ancestor spine, including the target. This returns
+    # parallel replies to the original question as well as the target's replies.
+    # A missing/inaccessible original remains opaque; its visible children may
+    # still be connected through a reply ID already exposed by visible content.
+    frontier = sorted(seen)
+    for _ in range(depth):
+      remaining = limit - len(result)
+      rows = await self._reply_candidates(
+        conn,
+        peer_ids,
+        frontier,
+        seen,
+        preferred,
+        remaining + 1,
+        children=True,
+      )
+      overflow = len(rows) > remaining
+      frontier = []
+      for row in rows[:remaining]:
+        result.append(row)
+        seen.add(row["msgid"])
+        frontier.append(row["msgid"])
+      if overflow:
+        truncated = True
+        break
+      if not frontier:
+        break
+    # Hitting the depth boundary is not proof of completeness. Probe only for
+    # an authorized unseen child; never count or disclose hidden branches.
+    if frontier and not truncated:
+      truncated = bool(
+        await self._reply_candidates(
+          conn,
+          peer_ids,
+          frontier,
+          seen,
+          preferred,
+          1,
+          children=True,
+        )
+      )
+    return result, truncated
+
   async def get_context(
-    self, conversation_id, msgid, principal: Principal, before=5, after=5, depth=5
+    self,
+    conversation_id,
+    msgid,
+    principal: Principal,
+    before=5,
+    after=5,
+    depth=5,
+    reply_limit=100,
   ):
     async with self.get_conn() as conn:
       allowed = await self._accessible_ids(conn, principal)
@@ -880,41 +1002,19 @@ class PostgreStore:
         target["created_at"],
         after,
       )
-      chain = []
-      seen = {msgid}
-      current = target
-      for _ in range(depth):
-        reply_id = current["reply_to_id"]
-        if not reply_id or reply_id in seen:
-          break
-        seen.add(reply_id)
-        current = await conn.fetchrow(
-          """
-          SELECT m.* FROM messages m
-          JOIN conversations c ON c.id = m.conversation_id
-          WHERE c.telegram_peer_type = (
-                  SELECT telegram_peer_type FROM conversations WHERE id = $1
-                )
-            AND c.telegram_peer_id = (
-                  SELECT telegram_peer_id FROM conversations WHERE id = $1
-                )
-            AND c.id = ANY($3::uuid[]) AND m.msgid = $2
-          ORDER BY (m.conversation_id = $1) DESC, m.created_at DESC
-          LIMIT 1
-        """,
-          conversation_id,
-          reply_id,
-          allowed or [],
-        )
-        if not current:
-          chain.append({"msgid": reply_id, "status": "unavailable"})
-          break
-        chain.append(current)
+      replies, truncated = await self._reply_thread(
+        conn,
+        target,
+        allowed,
+        depth,
+        reply_limit,
+      )
       return {
         "target": target,
         "before": list(reversed(before_rows)),
         "after": list(after_rows),
-        "replies": chain,
+        "replies": replies,
+        "replies_truncated": truncated,
       }
 
   async def get_revisions(self, conversation_id, msgid, principal: Principal):
@@ -986,7 +1086,8 @@ class PostgreStore:
       return await self.get_user(user_id)
     async with self.get_conn() as conn:
       current = await conn.fetchrow(
-        "SELECT is_admin, is_active FROM auth_users WHERE id = $1 FOR UPDATE", user_id
+        "SELECT is_admin, is_active FROM auth_users WHERE id = $1 FOR UPDATE",
+        user_id,
       )
       if not current:
         return None
@@ -1020,7 +1121,8 @@ class PostgreStore:
   async def delete_user(self, user_id):
     async with self.get_conn() as conn:
       current = await conn.fetchrow(
-        "SELECT is_admin, is_active FROM auth_users WHERE id = $1 FOR UPDATE", user_id
+        "SELECT is_admin, is_active FROM auth_users WHERE id = $1 FOR UPDATE",
+        user_id,
       )
       if not current:
         return False
@@ -1040,7 +1142,8 @@ class PostgreStore:
       ):
         raise ValueError("user does not exist")
       if not await conn.fetchval(
-        "SELECT EXISTS (SELECT 1 FROM conversations WHERE id = $1)", conversation_id
+        "SELECT EXISTS (SELECT 1 FROM conversations WHERE id = $1)",
+        conversation_id,
       ):
         raise ValueError("conversation does not exist")
       await conn.execute(
@@ -1134,4 +1237,100 @@ class PostgreStore:
     async with self.get_conn() as conn:
       return await conn.fetchrow(
         "SELECT * FROM conversations WHERE id = $1", conversation_id
+      )
+
+  async def monitoring_config_imported(self):
+    async with self.get_conn() as conn:
+      return await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM bootstrap_state WHERE name = $1)",
+        "group-monitoring-config-v1",
+      )
+
+  async def import_monitoring_config(self, groups):
+    # Resolve Telegram entities before entering this transaction. Serialize the
+    # one-time import across processes; disabled manual rows are never overwritten.
+    async with self.get_conn() as conn:
+      await conn.fetchval(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        "luoxu:monitoring-config-import",
+      )
+      if await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM bootstrap_state WHERE name = $1)",
+        "group-monitoring-config-v1",
+      ):
+        return False
+      for group in sorted(groups, key=lambda g: g.id):
+        info = await self.insert_group(conn, group)
+        await conn.execute(
+          """INSERT INTO group_monitoring (conversation_id) VALUES ($1)
+             ON CONFLICT (conversation_id) DO NOTHING""",
+          info["conversation_uuid"],
+        )
+      await conn.execute(
+        "INSERT INTO bootstrap_state (name) VALUES ($1)",
+        "group-monitoring-config-v1",
+      )
+      return True
+
+  async def add_monitored_group(self, group):
+    async with self.get_conn() as conn:
+      info = await self.insert_group(conn, group)
+      await conn.execute(
+        """INSERT INTO group_monitoring (conversation_id) VALUES ($1)
+           ON CONFLICT (conversation_id) DO UPDATE
+           SET manual_enabled = true, updated_at = now()""",
+        info["conversation_uuid"],
+      )
+      return info
+
+  async def set_manual_monitoring(self, conversation_id, enabled):
+    async with self.get_conn() as conn:
+      return bool(
+        await conn.fetchval(
+          """INSERT INTO group_monitoring (conversation_id, manual_enabled)
+           SELECT c.id, $2 FROM conversations c
+           JOIN tg_groups g ON g.conversation_id = c.id
+           WHERE c.id = $1 AND c.kind = 'group'
+           ON CONFLICT (conversation_id) DO UPDATE
+           SET manual_enabled = EXCLUDED.manual_enabled, updated_at = now()
+           RETURNING conversation_id""",
+          conversation_id,
+          enabled,
+        )
+      )
+
+  async def list_group_monitoring(self, conversation_id=None):
+    # Count references to a group's peer, including topic-only grants. These
+    # are indexing reasons, NOT a new path through the content-access checks.
+    async with self.get_conn() as conn:
+      return await conn.fetch(
+        """
+        WITH access_refs AS (
+          SELECT c.telegram_peer_type, c.telegram_peer_id,
+                 sum(r.user_ref)::bigint AS user_references,
+                 sum(r.public_ref)::bigint AS public_references
+          FROM (
+            SELECT conversation_id, 1 AS user_ref, 0 AS public_ref
+              FROM conversation_access
+            UNION ALL
+            SELECT conversation_id, 0, 1 FROM public_conversation_access
+          ) r JOIN conversations c ON c.id = r.conversation_id
+          WHERE c.kind IN ('group', 'topic')
+          GROUP BY c.telegram_peer_type, c.telegram_peer_id
+        ), counts AS (
+          SELECT c.*, coalesce(m.manual_enabled, false) AS manual_reference,
+                 coalesce(a.user_references, 0) AS user_references,
+                 coalesce(a.public_references, 0) AS public_references
+          FROM tg_groups g JOIN conversations c ON c.id = g.conversation_id
+          LEFT JOIN group_monitoring m ON m.conversation_id = c.id
+          LEFT JOIN access_refs a
+            ON a.telegram_peer_type = c.telegram_peer_type
+           AND a.telegram_peer_id = c.telegram_peer_id
+          WHERE c.kind = 'group' AND ($1::uuid IS NULL OR c.id = $1)
+        )
+        SELECT *, manual_reference::int + user_references + public_references
+                  AS reference_count
+        FROM counts ORDER BY telegram_peer_type, telegram_peer_id
+      """,
+        conversation_id,
       )
