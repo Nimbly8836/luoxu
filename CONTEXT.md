@@ -24,6 +24,9 @@ An indexed one-to-one Telegram conversation. It is not an accessible group and i
 **Conversation**:
 A searchable Telegram exchange represented in the archive. A conversation may be a group, a forum topic, or an explicitly indexed one-to-one private chat; each has its own access grants.
 
+**Forum topic**:
+A named discussion area in a Telegram group with Topics enabled. Ordinary message replies and their reply threads are not forum topics and remain part of the group conversation.
+
 **Message context**:
 The nearby conversation needed to understand a selected message, including its quoted or replied-to chain up to the supported depth. The surrounding window stays within the same group topic when the group uses Topics; unavailable referenced messages are represented as placeholders.
 

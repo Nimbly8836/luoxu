@@ -11,6 +11,10 @@ index_groups = [
   "@group2",
   "1000000000",
 ]
+# One-time repair of legacy fake topics, only for groups you confirm did not
+# use Topics. Also requires full Telegram metadata confirming a non-forum peer.
+# Back up the DB first. Topic-only grants are removed, not widened to the group.
+# repair_non_forum_groups = [1000000000]
 # Explicit one-to-one chats only; private chats are never public by default.
 # index_private_chats = ["@alice", "123456789"]
 # ipv6 = false

@@ -144,6 +144,57 @@ paths:
           description: Message or deleted marker
         '404':
           description: Not found or not accessible
+  /context:
+    get:
+      summary: Get message context by legacy group and message IDs
+      description: >-
+        Compatibility entry point for group messages, including forum topics.
+        Resolves the locally archived message and applies access control to its
+        actual conversation. Returns the same target, before, after, and replies
+        fields as the UUID context endpoint. Never fetches from Telegram.
+      parameters:
+        - name: g
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: before
+          in: query
+          description: Bounded by the configured context.before limit.
+          schema:
+            type: integer
+            minimum: 0
+            default: 5
+        - name: after
+          in: query
+          description: Bounded by the configured context.after limit.
+          schema:
+            type: integer
+            minimum: 0
+            default: 5
+        - name: depth
+          in: query
+          description: Bounded by the configured context.reply_depth limit.
+          schema:
+            type: integer
+            minimum: 0
+            default: 5
+      responses:
+        '200':
+          description: Message context with a bounded reply chain
+        '400':
+          description: Missing or invalid query parameters
+        '404':
+          description: Message not locally archived or not accessible
   /conversations/{conversation_id}/messages/{message_id}/context:
     get:
       summary: Get surrounding messages and reply chain

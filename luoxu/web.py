@@ -300,8 +300,22 @@ class MessageHandler(BaseHandler):
 
 
 class ContextHandler(MessageHandler):
+  async def _target_ids(self, request):
+    if "conversation_id" in request.match_info:
+      return self._uuid(request), _int(request.match_info["msgid"], "message id")
+    group_id = _int(request.query.get("g"), "group")
+    msgid = _int(request.query.get("id"), "message id")
+    if not 0 < group_id < 2**63 or not 0 < msgid < 2**63:
+      raise web.HTTPBadRequest(text="g and id must be positive 64-bit integers")
+    cid = await self.dbconn.find_group_message_conversation(
+      group_id, msgid, request["principal"]
+    )
+    if cid is None:
+      raise web.HTTPNotFound
+    return cid, msgid
+
   async def _get(self, request):
-    cid = self._uuid(request)
+    cid, msgid = await self._target_ids(request)
     config = request.app["context"]
     try:
       before = min(
@@ -322,7 +336,7 @@ class ContextHandler(MessageHandler):
       raise web.HTTPBadRequest
     context = await self.dbconn.get_context(
       cid,
-      _int(request.match_info["msgid"], "message id"),
+      msgid,
       request["principal"],
       before,
       after,
@@ -692,6 +706,7 @@ def setup_app(
     **(context_config or {}),
   }
   app.router.add_get(f"{prefix}/search", SearchHandler(dbconn).get)
+  app.router.add_get(f"{prefix}/context", ContextHandler(dbconn).get)
   app.router.add_get(f"{prefix}/groups", GroupsHandler(dbconn).get)
   app.router.add_get(f"{prefix}/names", NamesHandler(dbconn).get)
   app.router.add_get(f"{prefix}/conversations", ConversationHandler(dbconn).get)

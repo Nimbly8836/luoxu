@@ -110,12 +110,14 @@ Web API 支持账号密码登录和 JWT Bearer Token。未认证请求使用匿�
 
 在 `[web.auth]` 中配置随机 `jwt_secret`、token 有效期以及一次性的 bootstrap 管理员。管理员密码必须使用 Argon2id 哈希，不能写明文。管理员通过 `/admin/*` API 管理用户和会话授权。完整接口规范位于 `openapi.yaml`，运行后可在 `/luoxu/docs` 查看 Swagger UI。
 
-消息上下文使用 `/conversations/{conversation_id}/messages/{message_id}/context`，默认返回前后各 5 条消息以及最多 5 层回复链。消息编辑/删除历史由 `[web.message_history].enabled` 控制，默认关闭；开启后还必须在请求中传 `include_history=true`。历史只从功能启用并在线捕获之后开始记录。
+消息上下文支持 `/context?g={group_id}&id={message_id}` 和 `/conversations/{conversation_id}/messages/{message_id}/context` 两种入口（都需加上配置的 Web 前缀），默认返回前后各 5 条消息以及最多 5 层回复链；可用 `before`、`after`、`depth` 缩小窗口。两者返回相同的 `target`、`before`、`after`、`replies` 结构，只查询本地归档，消息未收录或无权限时返回 404。消息编辑/删除历史由 `[web.message_history].enabled` 控制，默认关闭；开启后还必须在请求中传 `include_history=true`。历史只从功能启用并在线捕获之后开始记录。
 
 数据库升级
 ====
 
 全新数据库执行 `dbsetup.sql`。已有数据库按顺序执行 `migrations/001_access_control.sql`、`migrations/002_conversations.sql` 和 `migrations/003_message_history.sql`。升级前请备份数据库。
+
+未启用 Topics 的群若出现大量同名 `topic`，请参阅[普通回复误分类修复说明](docs/topic-repair.md)。此次修复不需要新的 SQL 结构迁移；备份后，将确认未使用 Topics 的群 ID 加入 `telegram.repair_non_forum_groups`，更新并重启索引器后会在初始化这些群时自动归并旧数据。
 
 Docker
 ====

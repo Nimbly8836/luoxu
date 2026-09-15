@@ -93,7 +93,10 @@ class Indexer:
 
     web_config = config["web"]
     history_enabled = web_config.get("message_history", {}).get("enabled", False)
-    db = PostgreStore(config["database"], client, history_enabled=history_enabled)
+    db = PostgreStore(
+      config["database"], client, history_enabled=history_enabled,
+      repair_non_forum_groups=tg_config.get("repair_non_forum_groups", ()),
+    )
     await db.setup()
     auth = AuthService(web_config["auth"])
     await db.bootstrap(web_config["auth"], None, auth)

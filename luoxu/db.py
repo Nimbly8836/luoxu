@@ -6,6 +6,7 @@ import logging
 from typing import Any, Literal
 
 import asyncpg  # type: ignore[import-not-found]
+from telethon.tl import types
 
 from .auth import Principal  # type: ignore[import-not-found]
 from .ctxvars import group_title, msg_source
@@ -22,7 +23,8 @@ class PostgreStore:
   SEARCH_LIMIT = 50
 
   def __init__(
-    self, config: dict[str, Any], client=None, *, history_enabled=False
+    self, config: dict[str, Any], client=None, *, history_enabled=False,
+    repair_non_forum_groups=(),
   ) -> None:
     self.address = config["url"]
     first_year = config.get("first_year", 2016)
@@ -38,6 +40,13 @@ class PostgreStore:
       tzinfo=datetime.timezone.utc,
     )
     self.history_enabled = bool(history_enabled)
+    if not isinstance(repair_non_forum_groups, (list, tuple)) or any(
+      type(g) is not int or not 0 < g < 2**63 for g in repair_non_forum_groups
+    ):
+      raise ValueError(
+        "telegram.repair_non_forum_groups must be a list of positive 64-bit integer IDs"
+      )
+    self.repair_non_forum_groups = frozenset(repair_non_forum_groups)
     self.pool = None
 
   async def setup(self) -> None:
@@ -208,6 +217,7 @@ class PostgreStore:
   async def insert_group(self, conn, group):
     existing = await self.get_group(conn, group.id)
     if existing:
+      await self._repair_non_forum_topics(conn, group, existing["conversation_uuid"])
       return existing
     peer_type = "chat" if type(group).__name__ == "Chat" else "channel"
     conversation = await self._ensure_conversation(
@@ -219,7 +229,7 @@ class PostgreStore:
       getattr(group, "username", None),
       legacy_group_id=group.id,
     )
-    return await conn.fetchrow(
+    info = await conn.fetchrow(
       """
       INSERT INTO tg_groups (group_id, name, pub_id, conversation_id)
       VALUES ($1, $2, $3, $4)
@@ -230,6 +240,99 @@ class PostgreStore:
       group.title,
       getattr(group, "username", None),
       conversation["id"],
+    )
+    await self._repair_non_forum_topics(conn, group, info["conversation_uuid"])
+    return info
+
+  async def _repair_non_forum_topics(self, conn, group, parent_id):
+    """Undo legacy reply-thread conversations using a full Telegram entity.
+
+    Called during group initialization in the caller's transaction, not by Web
+    reads. Missing/minimal metadata is not proof that a group is non-forum.
+    The operator must also confirm the peer: a forum might have been disabled
+    after genuine topic messages were archived.
+    """
+    if group.id not in self.repair_non_forum_groups:
+      return
+    if isinstance(group, types.Channel):
+      if group.min or group.forum or getattr(group, "monoforum", False):
+        return
+      peer_type = "channel"
+    elif isinstance(group, types.Chat):
+      peer_type = "chat"
+    else:
+      return
+    topics = await conn.fetch(
+      """
+      SELECT c.id FROM conversations c
+      JOIN conversations parent ON parent.id = $1 AND parent.kind = 'group'
+        AND parent.telegram_peer_type = c.telegram_peer_type
+        AND parent.telegram_peer_id = c.telegram_peer_id
+      WHERE c.kind = 'topic' AND c.telegram_peer_type = $2
+        AND c.telegram_peer_id = $3
+      ORDER BY c.id FOR UPDATE OF c
+      """, parent_id, peer_type, group.id,
+    )
+    if not topics:
+      return
+    topic_ids = [row["id"] for row in topics]
+    grant_count = await conn.fetchval(
+      """
+      SELECT (SELECT count(*) FROM conversation_access
+              WHERE conversation_id = ANY($1::uuid[]))
+           + (SELECT count(*) FROM public_conversation_access
+              WHERE conversation_id = ANY($1::uuid[]))
+      """, topic_ids,
+    )
+    for topic_id in topic_ids:
+      await self._merge_topic_messages(conn, parent_id, topic_id, group.id)
+    # Preserve previously captured revisions even if collection is now disabled.
+    await conn.execute(
+      """
+      UPDATE message_revisions SET conversation_id = $1, topic_id = NULL
+      WHERE conversation_id = ANY($2::uuid[])
+      """, parent_id, topic_ids,
+    )
+    # FK cascades remove grants on invalid IDs. Never promote them to group
+    # grants: that would silently widen a topic-only user's or pub's access.
+    await conn.execute(
+      "DELETE FROM conversations WHERE id = ANY($1::uuid[])", topic_ids,
+    )
+    logger.warning(
+      "Consolidated %d reply-thread conversations into non-forum group %s; "
+      "%d obsolete topic grants removed (group grants unchanged)",
+      len(topic_ids), group.id, grant_count,
+    )
+
+  async def _merge_topic_messages(self, conn, parent_id, topic_id, group_id):
+    # Move atomically, including yearly partitions. Replayed duplicates may
+    # already exist in the parent; retain the latest state and never resurrect
+    # a deletion. This repair does not create new historical snapshots.
+    await conn.execute(
+      """
+      WITH moved AS (
+        DELETE FROM messages WHERE conversation_id = $2 RETURNING *
+      )
+      INSERT INTO messages (
+        conversation_id, group_id, msgid, reply_to_id, topic_id, quote_text,
+        from_user, from_user_name, text, media, created_at, updated_at, deleted_at
+      )
+      SELECT $1, $3, msgid, reply_to_id, NULL, quote_text,
+             from_user, from_user_name,
+             CASE WHEN deleted_at IS NULL THEN text ELSE '' END,
+             media, created_at, updated_at, deleted_at
+      FROM moved ORDER BY created_at, msgid
+      ON CONFLICT (conversation_id, msgid, created_at) DO UPDATE SET
+        group_id = EXCLUDED.group_id, topic_id = NULL,
+        reply_to_id = EXCLUDED.reply_to_id, quote_text = EXCLUDED.quote_text,
+        from_user = EXCLUDED.from_user, from_user_name = EXCLUDED.from_user_name,
+        text = EXCLUDED.text, media = EXCLUDED.media,
+        updated_at = EXCLUDED.updated_at, deleted_at = EXCLUDED.deleted_at
+      WHERE (EXCLUDED.deleted_at IS NOT NULL,
+             coalesce(EXCLUDED.deleted_at, EXCLUDED.updated_at, EXCLUDED.created_at))
+          > (messages.deleted_at IS NOT NULL,
+             coalesce(messages.deleted_at, messages.updated_at, messages.created_at))
+      """, parent_id, topic_id, group_id,
     )
 
   async def loaded_upto(
@@ -260,12 +363,14 @@ class PostgreStore:
       raise ValueError(f"unsupported Telegram peer: {peer!r}")
     reply = getattr(msg, "reply_to", None)
     topic_id = None
-    if reply:
-      topic_id = getattr(reply, "reply_to_top_id", None)
-      if topic_id is None:
-        topic_id = getattr(reply, "top_msg_id", None)
-    if kind == "group" and topic_id:
-      kind = "topic"
+    # reply_to_top_id also identifies ordinary reply/comment threads. Only
+    # Telegram's explicit forum_topic flag makes the reference a forum topic.
+    if peer_type == "channel" and getattr(reply, "forum_topic", False):
+      topic_id = getattr(reply, "reply_to_top_id", None) or getattr(
+        reply, "reply_to_msg_id", None
+      )
+      if topic_id:
+        kind = "topic"
     return kind, peer_type, peer_id, topic_id
 
   @staticmethod
@@ -657,6 +762,22 @@ class PostgreStore:
       sql += " GROUP BY from_user_name ORDER BY last_seen DESC LIMIT 15"
       rows = await conn.fetch(sql, *params)
       return [(uid, r["name"]) for r in rows for uid in r["uid"]]
+
+  async def find_group_message_conversation(self, group_id, msgid, principal: Principal):
+    """Resolve a legacy group/message pair without exposing inaccessible topics."""
+    async with self.get_conn() as conn:
+      allowed = await self._accessible_ids(conn, principal)
+      if not allowed:
+        return None
+      return await conn.fetchval(
+        """
+        SELECT m.conversation_id FROM messages m
+        JOIN conversations c ON c.id = m.conversation_id
+        WHERE m.group_id = $1 AND m.msgid = $2
+          AND c.kind IN ('group', 'topic') AND c.id = ANY($3::uuid[])
+        ORDER BY m.created_at DESC, (c.kind = 'group') DESC LIMIT 1
+        """, group_id, msgid, allowed,
+      )
 
   async def get_message(self, conversation_id, msgid, principal: Principal):
     async with self.get_conn() as conn:
