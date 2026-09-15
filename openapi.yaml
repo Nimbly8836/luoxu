@@ -253,12 +253,16 @@ paths:
     get:
       summary: Get an avatar for a sender visible to the current identity
       description: >-
-        Checks access before consulting the disk cache. Telegram lookup,
-        download, and download-lock waits share a 3-second deadline. Missing
-        photos, Telegram failures, or timeouts return the local default image;
-        deleted users return the ghost image, without an HTTP redirect.
-        Failed lookups back off for 30 seconds. User-specific responses are
-        private and not stored by HTTP caches.
+        Checks access before every cache hit. User-to-avatar metadata is cached
+        in-process for 5 minutes; expired entries serve the existing image while
+        refreshing. Cold requests wait at most 3 seconds, then return a local
+        default while the shared per-user load continues in the background.
+        Background queue/lookup/download work has a separate 30-second deadline,
+        at most 4 active workers and 128 active or queued tasks. Only failed
+        background loads back off for 30 seconds. After loading completes, a new
+        request is needed to see the photo; returned placeholders do not update
+        automatically. Missing photos return the default image and deleted users
+        the ghost image, without a redirect. Responses are private and no-store.
       parameters:
         - name: uid
           in: path
@@ -268,7 +272,16 @@ paths:
             format: int64
       responses:
         '200':
-          description: Avatar image
+          description: Avatar image or local placeholder
+          headers:
+            X-Luoxu-Avatar-Status:
+              description: >-
+                ready means an image is available; pending means loading or
+                refreshing; missing means no photo; deleted means deleted user;
+                unavailable means failed loading, a full queue, or shutdown.
+              schema:
+                type: string
+                enum: [ready, pending, missing, deleted, unavailable]
         '404':
           description: Sender is not visible to the current identity
   /avatar/{name}.jpg:

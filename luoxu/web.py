@@ -619,7 +619,11 @@ class AdminHandler:
 
 
 class AvatarHandler:
-  FETCH_TIMEOUT = 3.0
+  FETCH_TIMEOUT = 3.0  # HTTP wait only; expiry must not cancel cache population.
+  LOAD_TIMEOUT = 30.0
+  CACHE_SECONDS = 300.0
+  MAX_CACHED_USERS = 1024
+  MAX_PENDING = 128
   FAILURE_RETRY_SECONDS = 30.0
   MAX_FAILURES = 1024
   MAX_DOWNLOADS = 4
@@ -632,6 +636,9 @@ class AvatarHandler:
     self._photo_locks: WeakValueDictionary[int, Lock] = WeakValueDictionary()
     self._downloads = asyncio.Semaphore(self.MAX_DOWNLOADS)
     self._retry_after: OrderedDict[int, float] = OrderedDict()
+    self._known: OrderedDict[int, tuple[str, float]] = OrderedDict()
+    self._pending: dict[int, asyncio.Task[str]] = {}
+    self._closed = False
 
   async def _get_avatar(self, user: User) -> str:
     photo_id = getattr(getattr(user, "photo", None), "photo_id", None)
@@ -648,44 +655,120 @@ class AvatarHandler:
     async with lock:
       if os.path.exists(file):
         return file
-      async with self._downloads:
-        # Different photos/processes must not share a fixed tmp.jpg. Publish
-        # only a completed nonempty download, and clean up even on cancellation.
-        with tempfile.NamedTemporaryFile(
-          dir=self.cache_dir, prefix=f".avatar-{photo_id}-", suffix=".jpg", delete=False,
-        ) as temporary:
-          tmpfile = temporary.name
-        try:
-          downloaded = await self.client.download_profile_photo(user, file=tmpfile)
-          if not downloaded or os.path.getsize(tmpfile) == 0:
-            raise ValueError("avatar download returned no photo")
-          os.replace(tmpfile, file)
-        finally:
-          with suppress(FileNotFoundError):
-            os.unlink(tmpfile)
+      # Different photos/processes must not share a fixed tmp.jpg. Publish
+      # only a completed nonempty download, and clean up even on cancellation.
+      with tempfile.NamedTemporaryFile(
+        dir=self.cache_dir,
+        prefix=f".avatar-{photo_id}-",
+        suffix=".jpg",
+        delete=False,
+      ) as temporary:
+        tmpfile = temporary.name
+      try:
+        downloaded = await self.client.download_profile_photo(user, file=tmpfile)
+        if not downloaded or os.path.getsize(tmpfile) == 0:
+          raise ValueError("avatar download returned no photo")
+        os.replace(tmpfile, file)
+      finally:
+        with suppress(FileNotFoundError):
+          os.unlink(tmpfile)
     return file
 
-  async def _avatar_file(self, uid: int) -> str:
-    if self._retry_after.get(uid, 0) > time.monotonic():
-      return self.default_avatar
-    self._retry_after.pop(uid, None)
+  def _cached_file(self, uid: int) -> tuple[str, float] | None:
+    cached = self._known.get(uid)
+    if cached and os.path.isfile(cached[0]):
+      self._known.move_to_end(uid)
+      return cached
+    self._known.pop(uid, None)
+    return None
+
+  async def _load_avatar(self, uid: int) -> str:
+    stage = "queue"
     try:
-      # Includes entity lookup, lock/semaphore waits, and the whole download.
-      async with asyncio.timeout(self.FETCH_TIMEOUT):
+      # One limit for entity RPCs AND downloads, independent of HTTP lifetime.
+      async with asyncio.timeout(self.LOAD_TIMEOUT), self._downloads:
+        stage = "entity"
         user = await self.client.get_entity(uid)
         if getattr(user, "deleted", False):
-          return self.ghost_avatar
-        if getattr(getattr(user, "photo", None), "photo_id", None) is None:
-          return self.default_avatar
-        return await self._get_avatar(user)
+          file = self.ghost_avatar
+        elif getattr(getattr(user, "photo", None), "photo_id", None) is None:
+          file = self.default_avatar
+        else:
+          stage = "download"
+          file = await self._get_avatar(user)
+      self._known[uid] = (file, time.monotonic() + self.CACHE_SECONDS)
+      self._known.move_to_end(uid)
+      if len(self._known) > self.MAX_CACHED_USERS:
+        self._known.popitem(last=False)
+      self._retry_after.pop(uid, None)
+      return file
     except (TimeoutError, OSError, ValueError, RPCError) as exc:
-      # CancelledError intentionally propagates instead of becoming a fallback.
+      # Only a failed BACKGROUND load starts backoff, not a short HTTP wait.
       self._retry_after[uid] = time.monotonic() + self.FAILURE_RETRY_SECONDS
       self._retry_after.move_to_end(uid)
       if len(self._retry_after) > self.MAX_FAILURES:
         self._retry_after.popitem(last=False)
-      logger.warning("avatar fetch for user %s failed (%s); using default", uid, type(exc).__name__)
-      return self.default_avatar
+      logger.warning(
+        "avatar fetch for user %s failed at %s (%s); using cached/default image",
+        uid,
+        stage,
+        type(exc).__name__,
+      )
+      cached = self._cached_file(uid)
+      return cached[0] if cached else self.default_avatar
+
+  def _load_done(self, uid: int, task: asyncio.Task[str]) -> None:
+    self._pending.pop(uid, None)
+    # Observe unexpected failures even if every HTTP waiter has already left.
+    if not task.cancelled() and (exc := task.exception()) is not None:
+      logger.error(
+        "unexpected avatar load failure for user %s",
+        uid,
+        exc_info=(type(exc), exc, exc.__traceback__),
+      )
+
+  async def _avatar_file(self, uid: int) -> str:
+    cached = self._cached_file(uid)
+    now = time.monotonic()
+    if cached and cached[1] > now:
+      return cached[0]
+    fallback = cached[0] if cached else self.default_avatar
+    if self._closed or self._retry_after.get(uid, 0) > now:
+      return fallback
+    self._retry_after.pop(uid, None)
+    task = self._pending.get(uid)
+    if task is None:
+      if len(self._pending) >= self.MAX_PENDING:
+        return fallback
+      task = asyncio.create_task(self._load_avatar(uid), name=f"avatar-{uid}")
+      self._pending[uid] = task
+      task.add_done_callback(lambda done: self._load_done(uid, done))
+    if cached:
+      # Revalidate expired metadata without replacing a known photo with default.
+      return cached[0]
+    try:
+      return await asyncio.wait_for(asyncio.shield(task), self.FETCH_TIMEOUT)
+    except TimeoutError:
+      return fallback
+
+  def _status(self, uid: int, file: str) -> str:
+    if file not in (self.default_avatar, self.ghost_avatar):
+      return "ready"
+    if uid in self._pending:
+      return "pending"
+    if self._retry_after.get(uid, 0) > time.monotonic():
+      return "unavailable"
+    if uid not in self._known:
+      return "unavailable"  # queue full or application shutting down
+    return "deleted" if file == self.ghost_avatar else "missing"
+
+  async def close(self, _app=None) -> None:
+    self._closed = True
+    tasks = tuple(self._pending.values())
+    for task in tasks:
+      task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    self._pending.clear()
 
   async def get(self, request) -> web.FileResponse:
     if uid_str := request.match_info.get("uid"):
@@ -694,8 +777,10 @@ class AvatarHandler:
       if not await self.db.can_view_user(uid, request["principal"]):
         raise web.HTTPNotFound
       file = await self._avatar_file(uid)
+      avatar_headers = {"X-Luoxu-Avatar-Status": self._status(uid, file)}
       name, cache_control = uid_str, "private, no-store"
     elif name := request.match_info.get("name"):
+      avatar_headers = {}
       cache_control = f"public, max-age={86400 * 365}"
       if name == "ghost":
         file = self.ghost_avatar
@@ -712,6 +797,7 @@ class AvatarHandler:
         "Content-Type": "image/jpeg",
         "Cache-Control": cache_control,
         "Content-Disposition": f'inline; filename="avatar-{name}.jpg"',
+        **avatar_headers,
       },
     )
 
@@ -799,6 +885,7 @@ def setup_app(
     ah = AvatarHandler(client, dbconn, cache_dir, default_avatar, ghost_avatar)
     app.router.add_get(rf"{prefix}/avatar/{{uid:\d+}}.jpg", ah.get)
     app.router.add_get(rf"{prefix}/avatar/{{name:\w+}}.jpg", ah.get)
+    app.on_cleanup.append(ah.close)
   return app
 
 

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from aiohttp.test_utils import TestClient, TestServer
+from telethon.client.downloads import DownloadMethods
 from telethon.errors.rpcerrorlist import ChannelPrivateError
 from telethon.tl.types import User, UserProfilePhoto
 
@@ -57,16 +58,18 @@ class AvatarTests(unittest.IsolatedAsyncioTestCase):
         timeout = patch.object(AvatarHandler, "FETCH_TIMEOUT", 0.1)
         timeout.start()
         self.addCleanup(timeout.stop)
-        app = setup_app(
-            self.db,
-            None,
-            str(self.cache),
-            str(self.default),
-            str(self.ghost),
-            prefix=PREFIX,
-        )
-        app.router.add_get(PREFIX + r"/avatar/{uid:\d+}.jpg", self.handler.get)
-        app.router.add_get(PREFIX + r"/avatar/{name:\w+}.jpg", self.handler.get)
+        load_timeout = patch.object(AvatarHandler, "LOAD_TIMEOUT", 0.4)
+        load_timeout.start()
+        self.addCleanup(load_timeout.stop)
+        with patch("luoxu.web.AvatarHandler", return_value=self.handler):
+            app = setup_app(
+                self.db,
+                self.telegram,
+                str(self.cache),
+                str(self.default),
+                str(self.ghost),
+                prefix=PREFIX,
+            )
         self.client = TestClient(TestServer(app, shutdown_timeout=0.1))
         await self.client.start_server()
 
@@ -89,6 +92,195 @@ class AvatarTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.cache / "420.jpg").read_bytes(), PHOTO)
         self.telegram.download_profile_photo.assert_awaited_once()
         self.assertEqual(response.headers["Cache-Control"], "private, no-store")
+
+    async def test_http_deadline_does_not_cancel_a_slow_valid_avatar(self):
+        release = asyncio.Event()
+        finished = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def delayed(entity, *, file):
+            try:
+                await release.wait()
+                result = await self.download(entity, file=file)
+                finished.set()
+                return result
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        self.telegram.download_profile_photo.side_effect = delayed
+        try:
+            response, data = await self.fetch()
+            self.assertEqual((response.status, data), (200, DEFAULT))
+            self.assertFalse(
+                cancelled.is_set(), "HTTP wait must not abort useful avatar loading"
+            )
+            self.assertEqual(response.headers["X-Luoxu-Avatar-Status"], "pending")
+        finally:
+            release.set()
+        await asyncio.wait_for(finished.wait(), 0.5)
+        response, data = await self.fetch()
+        self.assertEqual((response.status, data), (200, PHOTO))
+        self.telegram.get_entity.assert_awaited_once()
+        self.telegram.download_profile_photo.assert_awaited_once()
+
+    async def test_warm_user_avatar_does_not_require_telegram_to_be_online(self):
+        self.assertEqual((await self.fetch())[1], PHOTO)
+
+        async def offline(_uid):
+            await asyncio.Event().wait()
+
+        self.telegram.get_entity.side_effect = offline
+        response, data = await self.fetch()
+        self.assertEqual((response.status, data), (200, PHOTO))
+        self.telegram.get_entity.assert_awaited_once()
+
+    async def test_slow_entity_lookup_can_finish_after_http_wait(self):
+        release = asyncio.Event()
+
+        async def delayed(uid):
+            await release.wait()
+            return user(uid)
+
+        self.telegram.get_entity.side_effect = delayed
+        response, data = await self.fetch()
+        self.assertEqual(data, DEFAULT)
+        self.assertEqual(response.headers["X-Luoxu-Avatar-Status"], "pending")
+        task = self.handler._pending[42]
+        self.assertFalse(task.done())
+        release.set()
+        await task
+        self.assertEqual((await self.fetch())[1], PHOTO)
+        self.telegram.get_entity.assert_awaited_once()
+
+    async def test_cancelled_waiter_does_not_cancel_shared_load(self):
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def delayed(entity, *, file):
+            started.set()
+            await release.wait()
+            return await self.download(entity, file=file)
+
+        self.telegram.download_profile_photo.side_effect = delayed
+        waiter = asyncio.create_task(self.handler._avatar_file(42))
+        await asyncio.wait_for(started.wait(), 0.5)
+        waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiter
+        task = self.handler._pending[42]
+        self.assertFalse(task.done())
+        release.set()
+        await task
+        self.assertEqual((await self.fetch())[1], PHOTO)
+
+    async def test_permission_revocation_blocks_pending_and_warm_cache(self):
+        release = asyncio.Event()
+
+        async def delayed(entity, *, file):
+            await release.wait()
+            return await self.download(entity, file=file)
+
+        self.telegram.download_profile_photo.side_effect = delayed
+        self.assertEqual((await self.fetch())[1], DEFAULT)
+        task = self.handler._pending[42]
+        self.db.can_view_user.return_value = False
+        self.assertEqual((await self.fetch())[0].status, 404)
+        release.set()
+        await task
+        self.assertIn(42, self.handler._known)
+        self.assertEqual((await self.fetch())[0].status, 404)
+        self.telegram.get_entity.assert_awaited_once()
+
+    async def test_expired_cache_serves_stale_while_photo_refreshes(self):
+        self.assertEqual((await self.fetch())[1], PHOTO)
+        self.handler._known[42] = (str(self.cache / "420.jpg"), 0)
+        release = asyncio.Event()
+        updated = PHOTO + b"updated"
+        self.telegram.get_entity.return_value = user(photo_id=421)
+
+        async def delayed(_entity, *, file):
+            await release.wait()
+            Path(file).write_bytes(updated)
+            return file
+
+        self.telegram.download_profile_photo.side_effect = delayed
+        self.assertEqual((await self.fetch())[1], PHOTO)
+        task = self.handler._pending[42]
+        release.set()
+        await task
+        self.assertEqual((await self.fetch())[1], updated)
+        self.assertEqual(self.telegram.get_entity.await_count, 2)
+
+    async def test_background_queue_and_entity_concurrency_are_bounded(self):
+        release = asyncio.Event()
+
+        async def delayed(uid):
+            await release.wait()
+            return user(uid, uid * 10)
+
+        self.telegram.get_entity.side_effect = delayed
+        self.handler._downloads = asyncio.Semaphore(1)
+        with patch.object(self.handler, "MAX_PENDING", 3):
+            responses = await asyncio.gather(
+                *(self.fetch(str(uid)) for uid in range(40, 44))
+            )
+            self.assertTrue(all(data == DEFAULT for _, data in responses))
+            self.assertEqual(len(self.handler._pending), 3)
+            self.telegram.get_entity.assert_awaited_once()
+            statuses = [r.headers["X-Luoxu-Avatar-Status"] for r, _ in responses]
+            self.assertEqual(statuses.count("pending"), 3)
+            self.assertEqual(statuses.count("unavailable"), 1)
+            tasks = tuple(self.handler._pending.values())
+            release.set()
+            await asyncio.gather(*tasks)
+        self.assertFalse(self.handler._pending)
+
+    async def test_success_cache_is_bounded_and_recovers_missing_files(self):
+        self.telegram.get_entity.side_effect = lambda uid: user(uid, uid * 10)
+        with patch.object(self.handler, "MAX_CACHED_USERS", 2):
+            for uid in (40, 41, 42):
+                self.assertEqual((await self.fetch(str(uid)))[1], PHOTO)
+            self.assertEqual(list(self.handler._known), [41, 42])
+        (self.cache / "420.jpg").unlink()
+        self.assertEqual((await self.fetch())[1], PHOTO)
+        self.assertEqual(self.telegram.download_profile_photo.await_count, 4)
+
+    async def test_app_cleanup_cancels_workers_and_removes_partial_files(self):
+        async def stalled(_entity, *, file):
+            Path(file).write_bytes(b"partial")
+            await asyncio.Event().wait()
+
+        self.telegram.download_profile_photo.side_effect = stalled
+        self.assertEqual((await self.fetch())[1], DEFAULT)
+        tasks = tuple(self.handler._pending.values())
+        self.assertTrue(tasks)
+        await self.client.close()
+        self.assertTrue(all(task.cancelled() for task in tasks))
+        self.assertFalse(self.handler._pending)
+        self.assertEqual(list(self.cache.iterdir()), [])
+        self.assertEqual(await self.handler._avatar_file(43), str(self.default))
+        self.telegram.get_entity.assert_awaited_once()
+
+    async def test_real_telethon_profile_download_uses_existing_temp_path(self):
+        # Exercise Telethon's real filename/result handling, mocking only transport.
+        async def write_file(_location, file, **_kwargs):
+            Path(file).write_bytes(PHOTO)
+            return file
+
+        transport = SimpleNamespace(
+            _get_proper_filename=DownloadMethods._get_proper_filename,
+            download_file=AsyncMock(side_effect=write_file),
+        )
+
+        async def profile_photo(entity, *, file):
+            return await DownloadMethods.download_profile_photo(
+                transport, entity, file=file
+            )
+
+        self.telegram.download_profile_photo.side_effect = profile_photo
+        self.assertEqual((await self.fetch())[1], PHOTO)
+        self.assertEqual([p.name for p in self.cache.iterdir()], ["420.jpg"])
+        transport.download_file.assert_awaited_once()
 
     async def test_cached_avatar_does_not_download_again(self):
         (self.cache / "420.jpg").write_bytes(PHOTO)
@@ -141,7 +333,12 @@ class AvatarTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((response.status, data), (200, DEFAULT))
         self.assertEqual(response.history, ())
         self.assertEqual(response.headers["Cache-Control"], "private, no-store")
-        self.assertEqual((await self.fetch())[1], DEFAULT)
+        self.assertEqual(response.headers["X-Luoxu-Avatar-Status"], "pending")
+        self.assertNotIn(42, self.handler._retry_after)
+        await asyncio.gather(*tuple(self.handler._pending.values()))
+        retry, data = await self.fetch()
+        self.assertEqual(data, DEFAULT)
+        self.assertEqual(retry.headers["X-Luoxu-Avatar-Status"], "unavailable")
         self.telegram.get_entity.assert_awaited_once()
         self.telegram.download_profile_photo.assert_not_awaited()
         # A retry-backoff entry never bypasses a newly revoked permission.
@@ -166,10 +363,13 @@ class AvatarTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Event().wait()
 
         self.telegram.download_profile_photo.side_effect = stalled
-        responses = await asyncio.gather(*(self.fetch() for _ in range(5)))
+        responses = await asyncio.gather(
+            *(self.fetch(str(uid)) for uid in range(40, 45))
+        )
         self.assertTrue(
             all(r.status == 200 and data == DEFAULT for r, data in responses)
         )
+        await asyncio.gather(*tuple(self.handler._pending.values()))
         self.assertEqual(list(self.cache.iterdir()), [])
 
     async def test_download_timeout_removes_partial_file(self):
@@ -180,6 +380,7 @@ class AvatarTests(unittest.IsolatedAsyncioTestCase):
         self.telegram.download_profile_photo.side_effect = stalled
         response, data = await self.fetch()
         self.assertEqual((response.status, data), (200, DEFAULT))
+        await asyncio.gather(*tuple(self.handler._pending.values()))
         self.assertEqual(list(self.cache.iterdir()), [])
 
     async def test_unavailable_telegram_avatar_returns_default(self):
@@ -205,10 +406,10 @@ class AvatarTests(unittest.IsolatedAsyncioTestCase):
     async def test_deleted_and_photoless_users_return_defaults_directly(self):
         for entity, expected in (
             (User(id=42, deleted=True), GHOST),
-            (User(id=42), DEFAULT),
+            (User(id=43), DEFAULT),
         ):
             self.telegram.get_entity.return_value = entity
-            response, data = await self.fetch()
+            response, data = await self.fetch(str(entity.id))
             self.assertEqual((response.status, data), (200, expected))
             self.assertEqual(response.history, ())
         self.telegram.download_profile_photo.assert_not_awaited()
