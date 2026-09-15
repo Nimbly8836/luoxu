@@ -238,7 +238,8 @@ class SearchHandler(BaseHandler):
       util.fromtimestamp(_int(query["start"], "start")) if query.get("start") else None
     )
     end = util.fromtimestamp(_int(query["end"], "end")) if query.get("end") else None
-    return SearchQuery(group, terms, sender, start, end, conversation_id)
+    exclude_sender = self._parse_sender(query.get("exclude_sender"))
+    return SearchQuery(group, terms, sender, start, end, conversation_id, exclude_sender)
 
   @staticmethod
   def _parse_sender(sender):

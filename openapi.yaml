@@ -103,6 +103,15 @@ paths:
           schema:
             type: string
             example: 123,456
+        - name: exclude_sender
+          in: query
+          description: >-
+            Comma-separated Telegram sender IDs to exclude. Applied together
+            with sender (exclusion wins). Messages with unknown sender IDs
+            are not excluded by this parameter. Omit or leave empty to disable.
+          schema:
+            type: string
+            example: "123,456"
         - name: start
           in: query
           schema:

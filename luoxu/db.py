@@ -739,6 +739,8 @@ class PostgreStore:
           AND ($5::uuid IS NULL OR m.conversation_id = $5)
           AND ($6::text IS NULL OR m.text &@~ $6)
           AND ($7::bigint[] IS NULL OR m.from_user = ANY($7))
+          AND ($9::bigint[] IS NULL OR m.from_user IS NULL
+               OR NOT (m.from_user = ANY($9)))
         ORDER BY m.created_at DESC, m.msgid DESC LIMIT $8
         """,
         allowed or [],
@@ -749,6 +751,7 @@ class PostgreStore:
         query,
         q.sender,
         max(0, limit),
+        q.exclude_sender,
       )
       highlight_query = query
       if highlight_query and rows:
