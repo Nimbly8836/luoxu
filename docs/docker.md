@@ -32,6 +32,74 @@ maintain a small local override for that dependency). The local image is
 PGroonga-enabled; an external PostgreSQL server must provide the extensions
 required by `dbsetup.sql` itself.
 
+## Published images: no local build needed
+
+The main application is published as `ghcr.io/nimbly8836/luoxu:latest` and
+`ghcr.io/nimbly8836/luoxu:sha-<full-commit>`. GHCR releases currently target
+**linux/amd64**; use a local build on ARM hosts. `core` and the repository's
+Python `web` service share this image. A separately maintained frontend image
+is not included in it.
+
+For an existing deployment (database and other dependencies already running),
+keep your existing configuration, passwords, volumes, and Compose overrides:
+
+```sh
+# Optionally export LUOXU_IMAGE=ghcr.io/nimbly8836/luoxu:sha-<full-commit>
+docker compose --profile core pull core
+docker compose --profile core up -d --no-build --no-deps core
+```
+
+This updates only `core`, without rebuilding it or restarting the database,
+OCR, or another frontend service. For a web-only deployment, replace the
+profile and service name `core` with `web`. On a fresh installation, omit
+`--no-deps` so Compose can start the configured database dependency. Do not
+use `up --build` when you intend to use the published application image.
+
+## Local builds and PyPI timeouts
+
+The builder installs the build tools declared in `pyproject.toml` in a cached
+layer before copying application source. Application packaging uses
+`--no-build-isolation` and `PIP_NO_INDEX=1`, so a source-only change does not
+create another isolated environment and download setuptools again. The pip
+cache is enabled and mounted as a BuildKit cache. Runtime dependencies,
+including transitive dependencies, are collected as wheels; installation in
+the final image is explicitly offline (`--network=none`, `--no-index`).
+
+The default PyPI socket timeout is 120 seconds, with 5 connection retries.
+If the build host cannot reach PyPI reliably, choose an HTTPS mirror you trust:
+
+```sh
+LUOXU_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+LUOXU_PIP_TIMEOUT=120 LUOXU_PIP_RETRIES=5 \
+docker compose --profile core build core
+
+# Replace only the existing application container after the build succeeds.
+docker compose --profile core up -d --no-build --no-deps core
+```
+
+These settings apply to local builds of both `core` and the repository's
+Python `web` service, not to a separate frontend or OCR build. With plain
+`docker build`, use `--build-arg PIP_INDEX_URL=...`,
+`--build-arg PIP_DEFAULT_TIMEOUT=...`, and `--build-arg PIP_RETRIES=...`.
+Do not disable TLS verification or put index credentials in build arguments.
+
+The first build still needs network access for the base image, APT, Rust,
+Cargo crates, and the dependency layer. This is **not** a fully offline build,
+and increasing pip retries does not guarantee recovery from every mid-download
+read timeout. Avoid `--no-cache` for normal updates; it forces dependency layers
+to run again.
+
+A build regression check after building the `builder` target is:
+
+```sh
+docker build --target builder -t luoxu:builder-check .
+docker run --rm --network none -e PIP_NO_INDEX=1 luoxu:builder-check \
+  python -m pip wheel --no-build-isolation --no-deps --wheel-dir /tmp/wheels .
+```
+
+This second command must package the application without downloading Python
+build tools (the first build has already populated Cargo's dependency cache).
+
 ## Compose combinations
 
 Compose profiles are explicit:
@@ -88,6 +156,6 @@ POSTGRES_PASSWORD='change-me' docker compose -f docker-compose.yml \
   -f docker-compose.gpu.yml --profile core --profile ocr up --build
 ```
 
-The GPU image is amd64-only upstream. The CPU core image and the PGroonga image
-are built/published for the host architectures supported by their upstream
-images; verify architecture availability before deploying to ARM hardware.
+The GPU image is amd64-only upstream. The main application can be built locally for the host architecture, but
+its current GHCR publication workflow only publishes amd64. Verify availability
+of the database/base images before deploying to ARM hardware.
