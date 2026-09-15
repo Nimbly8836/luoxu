@@ -4,18 +4,20 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 import uuid
 from asyncio import Lock
+from collections import OrderedDict
+from contextlib import suppress
 from html import escape as htmlescape
+from weakref import WeakValueDictionary
 
 import asyncpg  # type: ignore[import-not-found]
 import jwt  # type: ignore[import-not-found]
 from aiohttp import web  # type: ignore[import-not-found]
-from telethon.errors.rpcerrorlist import (  # type: ignore[import-not-found]
-  ChannelPrivateError,
-)
-from telethon.tl.types import ChatPhotoEmpty, User  # type: ignore[import-not-found]
+from telethon.errors import RPCError  # type: ignore[import-not-found]
+from telethon.tl.types import User  # type: ignore[import-not-found]
 
 from . import util
 from .auth import AuthService, Principal  # type: ignore[import-not-found]
@@ -617,50 +619,84 @@ class AdminHandler:
 
 
 class AvatarHandler:
+  FETCH_TIMEOUT = 3.0
+  FAILURE_RETRY_SECONDS = 30.0
+  MAX_FAILURES = 1024
+  MAX_DOWNLOADS = 4
+
   def __init__(
     self, client, db, cache_dir, default_avatar: str, ghost_avatar: str
   ) -> None:
     self.client, self.db, self.cache_dir = client, db, cache_dir
     self.default_avatar, self.ghost_avatar = default_avatar, ghost_avatar
-    self.lock = Lock()
+    self._photo_locks: WeakValueDictionary[int, Lock] = WeakValueDictionary()
+    self._downloads = asyncio.Semaphore(self.MAX_DOWNLOADS)
+    self._retry_after: OrderedDict[int, float] = OrderedDict()
 
   async def _get_avatar(self, user: User) -> str:
-    photo = getattr(user, "photo", None)
-    photo_id = getattr(photo, "photo_id", None)
+    photo_id = getattr(getattr(user, "photo", None), "photo_id", None)
     if photo_id is None:
       raise ValueError("user has no downloadable avatar")
-    filename = f"{photo_id}.jpg"
-    file = os.path.join(self.cache_dir, filename)
-    tmpfile = os.path.join(self.cache_dir, "tmp.jpg")
-    if not os.path.exists(file):
-      async with self.lock:
-        if not os.path.exists(file):
-          await self.client.download_profile_photo(user, file=tmpfile)
-
+    file = os.path.join(self.cache_dir, f"{photo_id}.jpg")
+    if os.path.exists(file):
+      return file
+    # Only the download path owns this lock. Strong local references keep it
+    # alive while any request waits; unused locks disappear from the weak map.
+    lock = self._photo_locks.get(photo_id)
+    if lock is None:
+      self._photo_locks[photo_id] = lock = Lock()
+    async with lock:
+      if os.path.exists(file):
+        return file
+      async with self._downloads:
+        # Different photos/processes must not share a fixed tmp.jpg. Publish
+        # only a completed nonempty download, and clean up even on cancellation.
+        with tempfile.NamedTemporaryFile(
+          dir=self.cache_dir, prefix=f".avatar-{photo_id}-", suffix=".jpg", delete=False,
+        ) as temporary:
+          tmpfile = temporary.name
+        try:
+          downloaded = await self.client.download_profile_photo(user, file=tmpfile)
+          if not downloaded or os.path.getsize(tmpfile) == 0:
+            raise ValueError("avatar download returned no photo")
           os.replace(tmpfile, file)
+        finally:
+          with suppress(FileNotFoundError):
+            os.unlink(tmpfile)
     return file
+
+  async def _avatar_file(self, uid: int) -> str:
+    if self._retry_after.get(uid, 0) > time.monotonic():
+      return self.default_avatar
+    self._retry_after.pop(uid, None)
+    try:
+      # Includes entity lookup, lock/semaphore waits, and the whole download.
+      async with asyncio.timeout(self.FETCH_TIMEOUT):
+        user = await self.client.get_entity(uid)
+        if getattr(user, "deleted", False):
+          return self.ghost_avatar
+        if getattr(getattr(user, "photo", None), "photo_id", None) is None:
+          return self.default_avatar
+        return await self._get_avatar(user)
+    except (TimeoutError, OSError, ValueError, RPCError) as exc:
+      # CancelledError intentionally propagates instead of becoming a fallback.
+      self._retry_after[uid] = time.monotonic() + self.FAILURE_RETRY_SECONDS
+      self._retry_after.move_to_end(uid)
+      if len(self._retry_after) > self.MAX_FAILURES:
+        self._retry_after.popitem(last=False)
+      logger.warning("avatar fetch for user %s failed (%s); using default", uid, type(exc).__name__)
+      return self.default_avatar
 
   async def get(self, request) -> web.FileResponse:
     if uid_str := request.match_info.get("uid"):
       uid = _int(uid_str, "user id")
+      # Authorization must precede disk-cache hits and failure-backoff hits.
       if not await self.db.can_view_user(uid, request["principal"]):
         raise web.HTTPNotFound
-      try:
-        user = await self.client.get_entity(uid)
-      except ChannelPrivateError as exc:
-        raise web.HTTPForbidden(
-          headers={"Cache-Control": "public, max-age=86400"}
-        ) from exc
-      if getattr(user, "deleted", False):
-        raise web.HTTPTemporaryRedirect("ghost.jpg")
-      photo = getattr(user, "photo", None)
-      if not photo or isinstance(photo, ChatPhotoEmpty):
-        raise web.HTTPTemporaryRedirect("nobody.jpg")
-      async with self.lock:
-        file = await self._get_avatar(user)
-      name, max_age = re.sub(r"[^A-Za-z0-9_.-]", "_", user.username or uid_str), 14400
+      file = await self._avatar_file(uid)
+      name, cache_control = uid_str, "private, no-store"
     elif name := request.match_info.get("name"):
-      max_age = 86400 * 365
+      cache_control = f"public, max-age={86400 * 365}"
       if name == "ghost":
         file = self.ghost_avatar
       elif name == "nobody":
@@ -674,7 +710,7 @@ class AvatarHandler:
       headers={
         "Vary": "Authorization",
         "Content-Type": "image/jpeg",
-        "Cache-Control": f"public, max-age={max_age}",
+        "Cache-Control": cache_control,
         "Content-Disposition": f'inline; filename="avatar-{name}.jpg"',
       },
     )

@@ -112,6 +112,8 @@ Web API 支持账号密码登录和 JWT Bearer Token。未认证请求使用匿�
 
 消息上下文支持 `/context?g={group_id}&id={message_id}` 和 `/conversations/{conversation_id}/messages/{message_id}/context` 两种入口（都需加上配置的 Web 前缀），默认返回前后各 5 条消息以及最多 5 层回复链；可用 `before`、`after`、`depth` 缩小窗口。两者返回相同的 `target`、`before`、`after`、`replies` 结构，只查询本地归档，消息未收录或无权限时返回 404。消息编辑/删除历史由 `[web.message_history].enabled` 控制，默认关闭；开启后还必须在请求中传 `include_history=true`。历史只从功能启用并在线捕获之后开始记录。
 
+头像请求使用 `/avatar/{uid}.jpg`，只允许访问当前身份可见的消息发送者。未缓存头像按照片分别加锁、最多并行下载 4 张；Telegram 用户资料查询、锁等待和下载共用 3 秒时限。超时或下载失败会直接返回本地默认头像，并对该用户退避 30 秒，避免反复占用浏览器连接。已删除用户直接返回 ghost 头像，不再通过跳转额外请求。用户头像响应为 `private, no-store`，下载文件仍保留在服务端磁盘缓存中。
+
 数据库升级
 ====
 

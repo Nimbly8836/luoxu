@@ -252,6 +252,13 @@ paths:
   /avatar/{uid}.jpg:
     get:
       summary: Get an avatar for a sender visible to the current identity
+      description: >-
+        Checks access before consulting the disk cache. Telegram lookup,
+        download, and download-lock waits share a 3-second deadline. Missing
+        photos, Telegram failures, or timeouts return the local default image;
+        deleted users return the ghost image, without an HTTP redirect.
+        Failed lookups back off for 30 seconds. User-specific responses are
+        private and not stored by HTTP caches.
       parameters:
         - name: uid
           in: path
@@ -263,7 +270,7 @@ paths:
         '200':
           description: Avatar image
         '404':
-          description: Sender is not visible or has no avatar
+          description: Sender is not visible to the current identity
   /avatar/{name}.jpg:
     get:
       summary: Get a default or deleted-user avatar
