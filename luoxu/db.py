@@ -23,7 +23,11 @@ class PostgreStore:
   SEARCH_LIMIT = 50
 
   def __init__(
-    self, config: dict[str, Any], client=None, *, history_enabled=False,
+    self,
+    config: dict[str, Any],
+    client=None,
+    *,
+    history_enabled=False,
     repair_non_forum_groups=(),
   ) -> None:
     self.address = config["url"]
@@ -214,7 +218,21 @@ class PostgreStore:
       group_id,
     )
 
+  @staticmethod
+  async def _lock_peer_writes(conn, peer_id, *, exclusive=False):
+    # Repair relocates rows, so writers must wait BEFORE their lookup snapshot.
+    # Transaction-scoped locks also coordinate separate indexer processes.
+    # Use the numeric peer ID so deletion events without a peer type cooperate.
+    if exclusive:
+      sql = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
+    else:
+      sql = "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))"
+    await conn.fetchval(sql, f"luoxu:peer-write:{peer_id}")
+
   async def insert_group(self, conn, group):
+    await self._lock_peer_writes(
+      conn, group.id, exclusive=group.id in self.repair_non_forum_groups,
+    )
     existing = await self.get_group(conn, group.id)
     if existing:
       await self._repair_non_forum_topics(conn, group, existing["conversation_uuid"])
@@ -271,7 +289,10 @@ class PostgreStore:
       WHERE c.kind = 'topic' AND c.telegram_peer_type = $2
         AND c.telegram_peer_id = $3
       ORDER BY c.id FOR UPDATE OF c
-      """, parent_id, peer_type, group.id,
+      """,
+      parent_id,
+      peer_type,
+      group.id,
     )
     if not topics:
       return
@@ -282,7 +303,8 @@ class PostgreStore:
               WHERE conversation_id = ANY($1::uuid[]))
            + (SELECT count(*) FROM public_conversation_access
               WHERE conversation_id = ANY($1::uuid[]))
-      """, topic_ids,
+      """,
+      topic_ids,
     )
     for topic_id in topic_ids:
       await self._merge_topic_messages(conn, parent_id, topic_id, group.id)
@@ -291,17 +313,22 @@ class PostgreStore:
       """
       UPDATE message_revisions SET conversation_id = $1, topic_id = NULL
       WHERE conversation_id = ANY($2::uuid[])
-      """, parent_id, topic_ids,
+      """,
+      parent_id,
+      topic_ids,
     )
     # FK cascades remove grants on invalid IDs. Never promote them to group
     # grants: that would silently widen a topic-only user's or pub's access.
     await conn.execute(
-      "DELETE FROM conversations WHERE id = ANY($1::uuid[])", topic_ids,
+      "DELETE FROM conversations WHERE id = ANY($1::uuid[])",
+      topic_ids,
     )
     logger.warning(
       "Consolidated %d reply-thread conversations into non-forum group %s; "
       "%d obsolete topic grants removed (group grants unchanged)",
-      len(topic_ids), group.id, grant_count,
+      len(topic_ids),
+      group.id,
+      grant_count,
     )
 
   async def _merge_topic_messages(self, conn, parent_id, topic_id, group_id):
@@ -332,7 +359,10 @@ class PostgreStore:
              coalesce(EXCLUDED.deleted_at, EXCLUDED.updated_at, EXCLUDED.created_at))
           > (messages.deleted_at IS NOT NULL,
              coalesce(messages.deleted_at, messages.updated_at, messages.created_at))
-      """, parent_id, topic_id, group_id,
+      """,
+      parent_id,
+      topic_id,
+      group_id,
     )
 
   async def loaded_upto(
@@ -512,6 +542,10 @@ class PostgreStore:
     if not formatted:
       return
     async with self.get_conn() as conn:
+      # Lock peers in a stable order for multi-peer batches. Normal writers can
+      # run concurrently, but all yield to an exclusive relocation transaction.
+      for peer_id in sorted({self._peer_info(msg)[2] for msg, _ in formatted}):
+        await self._lock_peer_writes(conn, peer_id)
       data = [
         (msg, text, await self._conversation_for_message(conn, msg))
         for msg, text in formatted
@@ -539,6 +573,7 @@ class PostgreStore:
     peer_type=None,
   ) -> None:
     async with self.get_conn() as conn:
+      await self._lock_peer_writes(conn, peer_id)
       kinds = ("private_chat",) if kind == "private_chat" else ("group", "topic")
       for msgid in message_ids:
         old = await conn.fetchrow(
@@ -763,7 +798,9 @@ class PostgreStore:
       rows = await conn.fetch(sql, *params)
       return [(uid, r["name"]) for r in rows for uid in r["uid"]]
 
-  async def find_group_message_conversation(self, group_id, msgid, principal: Principal):
+  async def find_group_message_conversation(
+    self, group_id, msgid, principal: Principal
+  ):
     """Resolve a legacy group/message pair without exposing inaccessible topics."""
     async with self.get_conn() as conn:
       allowed = await self._accessible_ids(conn, principal)
@@ -776,7 +813,10 @@ class PostgreStore:
         WHERE m.group_id = $1 AND m.msgid = $2
           AND c.kind IN ('group', 'topic') AND c.id = ANY($3::uuid[])
         ORDER BY m.created_at DESC, (c.kind = 'group') DESC LIMIT 1
-        """, group_id, msgid, allowed,
+        """,
+        group_id,
+        msgid,
+        allowed,
       )
 
   async def get_message(self, conversation_id, msgid, principal: Principal):

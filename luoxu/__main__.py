@@ -94,7 +94,9 @@ class Indexer:
     web_config = config["web"]
     history_enabled = web_config.get("message_history", {}).get("enabled", False)
     db = PostgreStore(
-      config["database"], client, history_enabled=history_enabled,
+      config["database"],
+      client,
+      history_enabled=history_enabled,
       repair_non_forum_groups=tg_config.get("repair_non_forum_groups", ()),
     )
     await db.setup()
@@ -268,7 +270,12 @@ class Indexer:
     if self.client is None or self.dbstore is None:
       raise RuntimeError("Telegram client is not ready")
     try:
-      entity = cast(Any, await self.client.get_entity(target if not target.lstrip("-").isdigit() else int(target)))
+      entity = cast(
+        Any,
+        await self.client.get_entity(
+          target if not target.lstrip("-").isdigit() else int(target)
+        ),
+      )
     except Exception as exc:
       raise ValueError("group not found") from exc
     if entity.id in self.group_forward_history_done:
@@ -278,7 +285,13 @@ class Indexer:
     self.group_forward_history_done[entity.id] = False
     self.client.add_event_handler(self.on_message, events.NewMessage(chats=[entity]))
     self.client.add_event_handler(self.on_message, events.MessageEdited(chats=[entity]))
-    asyncio.create_task(GroupHistoryIndexer(entity, info, entity.id not in self.ocr_ignore_group_ids).run(self.client, self.dbstore, partial(operator.setitem, self.group_forward_history_done, entity.id, True)))
+    asyncio.create_task(
+      GroupHistoryIndexer(entity, info, entity.id not in self.ocr_ignore_group_ids).run(
+        self.client,
+        self.dbstore,
+        partial(operator.setitem, self.group_forward_history_done, entity.id, True),
+      )
+    )
     return info
 
   async def init_group(self, group):
