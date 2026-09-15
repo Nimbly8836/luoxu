@@ -231,7 +231,9 @@ class PostgreStore:
 
   async def insert_group(self, conn, group):
     await self._lock_peer_writes(
-      conn, group.id, exclusive=group.id in self.repair_non_forum_groups,
+      conn,
+      group.id,
+      exclusive=group.id in self.repair_non_forum_groups,
     )
     existing = await self.get_group(conn, group.id)
     if existing:
