@@ -61,7 +61,7 @@ python -m luoxu
 注意事项
 ====
 
-不要直接将索引了私有群组/频道的 API 公开于网络上！任何人都能获取其内容的。公开索引了公开群组或频道的服务前，也请获取群组/频道管理员的同意。
+将 API 开放到网络前，务必配置认证并核对公开授权和各账号权限，避免把私有群组/频道的归档误设为公开。公开索引了公开群组或频道的服务前，也请获取群组/频道管理员的同意。
 
 luoxu 相当于运行一个 Telegram 客户端，其权限是完全的（包括创建新的登录、结束已有会话、设置两步验证等）。请注意保护账号安全，不要在不信任的服务器上登录与运行本项目！
 
@@ -109,6 +109,8 @@ reindex index message_idx;
 Web API 支持账号密码登录和 JWT Bearer Token。未认证请求使用匿名 `pub` 角色，只能访问数据库中明确公开的群；登录用户继承公开群权限，并叠加管理员授予的群或私聊会话权限。私聊必须在 `telegram.index_private_chats` 中明确配置，且不会对匿名用户公开。
 
 在 `[web.auth]` 中配置随机 `jwt_secret`、token 有效期以及一次性的 bootstrap 管理员。管理员密码必须使用 Argon2id 哈希，不能写明文。管理员通过 `/admin/*` API 管理用户和会话授权。完整接口规范位于 `openapi.yaml`，运行后可在 `/luoxu/docs` 查看 Swagger UI。
+
+**监听不等于公开，也不等于给所有账号授权。** 管理员通过 `/admin/groups` 添加监听，通过 `/admin/users/{user_id}/grants/{conversation_id}` 按账号授权；只有加入 `/admin/public/{conversation_id}` 的群才对匿名和所有登录用户公开。需要区分 A、B 可见范围的群不要设为公开。管理列表 `/admin/conversations` 和添加响应包含 `is_public`，不要用 Telegram 用户名字段 `pub_id` 判断权限。操作流程、权限边界及动态监听的重启限制见[群组访问管理](docs/group-access.md)。
 
 消息上下文支持 `/context?g={group_id}&id={message_id}` 和 `/conversations/{conversation_id}/messages/{message_id}/context` 两种入口（都需加上配置的 Web 前缀），默认返回前后各 5 条消息以及最多 5 层回复链；可用 `before`、`after`、`depth` 缩小窗口。两者返回相同的 `target`、`before`、`after`、`replies` 结构，只查询本地归档，消息未收录或无权限时返回 404。消息编辑/删除历史由 `[web.message_history].enabled` 控制，默认关闭；开启后还必须在请求中传 `include_history=true`。历史只从功能启用并在线捕获之后开始记录。
 

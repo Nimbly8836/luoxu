@@ -16,6 +16,15 @@ A named permission boundary used to decide which indexed groups an identity may 
 **Accessible group**:
 An indexed Telegram group that the current identity is allowed to list, search, and inspect through the archive. The anonymous `pub` role can only receive explicitly granted public-group access.
 
+**Monitored group**:
+A Telegram group selected for message indexing. Starting monitoring does not make its archive public or grant any account access.
+
+**Public group archive**:
+An archive explicitly accessible to the anonymous `pub` role and therefore to every authenticated user. This is independent of whether the Telegram group has a public username. A group requiring per-account visibility must not receive public access.
+
+**Administrator**:
+An account allowed to enumerate all archived conversations, start monitoring, and manage accounts and grants through administration APIs. Administrative management authority does not bypass grants in ordinary content APIs; administrators can explicitly grant their own accounts access.
+
 **Private conversation**:
 An indexed one-to-one Telegram conversation. It is not an accessible group and is denied to anonymous visitors by definition; a named user needs an explicit grant for the conversation.
 

@@ -297,16 +297,111 @@ paths:
       responses:
         '200':
           description: Avatar image
+  /admin/groups:
+    post:
+      summary: Start monitoring a group or return an already monitored group
+      description: >-
+        Administrator only. Monitoring does not publish the archive or grant
+        user access. Returns the canonical conversation UUID for later grants.
+        Requires a running indexer with the group-monitoring callback; web-only
+        mode returns 503. Dynamic monitoring is process-local; after a restart,
+        configure telegram.index_groups or add the group again. Stored archives
+        and access grants persist.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [group]
+              properties:
+                group:
+                  description: Nonempty Telegram group reference or numeric ID
+                  oneOf:
+                    - type: string
+                      minLength: 1
+                      examples: ['-1001234567890']
+                    - type: integer
+                      format: int64
+      responses:
+        '201':
+          description: Monitored conversation, without changing existing grants
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [conversation]
+                properties:
+                  conversation:
+                    $ref: '#/components/schemas/AdminConversation'
+        '400':
+          description: Invalid group request
+        '401':
+          description: Authentication required
+        '403':
+          description: Administrator required
+        '503':
+          description: Monitoring or conversation metadata is unavailable
   /admin/conversations:
     get:
       summary: List all conversations for permission management
+      description: >-
+        Management list, not the current user's content access list. is_public
+        reflects effective anonymous access, including inherited public topics.
+        Telegram pub_id is a username and must not be used as an access flag.
       security:
         - bearerAuth: []
       responses:
         '200':
           description: Administrator-only conversation list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [conversations]
+                properties:
+                  conversations:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AdminConversation'
+        '401':
+          description: Authentication required
         '403':
           description: Administrator required
+  /admin/public:
+    get:
+      summary: List explicit public conversation grants
+      description: >-
+        All signed-in users inherit public access. Inherited topic access
+        need not have a separate explicit topic grant in this list.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Conversations with explicit anonymous pub grants
+        '401':
+          description: Authentication required
+        '403':
+          description: Administrator required
+  /admin/users/{user_id}/grants:
+    parameters:
+      - $ref: '#/components/parameters/user_id'
+    get:
+      summary: List a user's explicit conversation grants
+      description: Does not include inherited public or parent-group access.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Explicitly granted conversations
+        '401':
+          description: Authentication required
+        '403':
+          description: Administrator required
+        '404':
+          description: User not found
   /admin/users:
     get:
       summary: List users
@@ -378,6 +473,9 @@ paths:
         '204':
           description: Deleted
   /admin/users/{user_id}/grants/{conversation_id}:
+    parameters:
+      - $ref: '#/components/parameters/user_id'
+      - $ref: '#/components/parameters/conversation_id'
     put:
       summary: Grant a user conversation access
       security:
@@ -387,14 +485,21 @@ paths:
           description: Granted
     delete:
       summary: Revoke a user conversation grant
+      description: >-
+        Public and inherited parent-group grants may still allow access.
       security:
         - bearerAuth: []
       responses:
         '204':
           description: Revoked
   /admin/public/{conversation_id}:
+    parameters:
+      - $ref: '#/components/parameters/conversation_id'
     post:
       summary: Add a conversation to anonymous pub access
+      description: >-
+        Grants anonymous and all authenticated users access.
+        Private chats are rejected.
       security:
         - bearerAuth: []
       responses:
@@ -402,6 +507,8 @@ paths:
           description: Granted
     delete:
       summary: Remove anonymous pub access
+      description: >-
+        Does not revoke individual user grants or delete archived messages.
       security:
         - bearerAuth: []
       responses:
@@ -416,7 +523,58 @@ paths:
         '204':
           description: Revoked
 components:
+  schemas:
+    AdminConversation:
+      type: object
+      required:
+        - id
+        - kind
+        - name
+        - telegram_peer_type
+        - telegram_peer_id
+        - topic_id
+        - pub_id
+        - legacy_group_id
+        - is_public
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Conversation UUID used in access-grant APIs
+        kind:
+          type: string
+          enum: [group, topic, private_chat]
+        name:
+          type: string
+        telegram_peer_type:
+          type: string
+          enum: [chat, channel, user]
+        telegram_peer_id:
+          type: integer
+          format: int64
+        topic_id:
+          type: [integer, 'null']
+          format: int64
+        pub_id:
+          type: [string, 'null']
+          description: >-
+            Telegram public username, not a Luoxu access-permission flag
+        legacy_group_id:
+          type: [integer, 'null']
+          format: int64
+        is_public:
+          type: boolean
+          readOnly: true
+          description: >-
+            Effective anonymous access, including inherited public group topics
   parameters:
+    user_id:
+      name: user_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
     conversation_id:
       name: conversation_id
       in: path

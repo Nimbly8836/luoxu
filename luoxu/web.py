@@ -476,10 +476,23 @@ class AdminHandler:
       {"users": [_user_json(u) for u in await self.db.list_users()]}
     )
 
+  async def _public_conversation_ids(self):
+    # Reuse effective anonymous access, including inherited public forum topics.
+    rows = await self.db.list_conversations(Principal(None, None))
+    return {row["id"] for row in rows}
+
   async def conversations(self, request):
     await require_admin(request)
     rows = await self.db.list_all_conversations()
-    return web.json_response({"conversations": [_conversation_json(r) for r in rows]})
+    public_ids = await self._public_conversation_ids()
+    return web.json_response(
+      {
+        "conversations": [
+          {**_conversation_json(r), "is_public": r["id"] in public_ids} for r in rows
+        ]
+      },
+      headers={"Cache-Control": "private, no-store"},
+    )
 
   async def user_grants(self, request):
     await require_admin(request)
@@ -599,13 +612,32 @@ class AdminHandler:
       raise web.HTTPServiceUnavailable(text="group monitoring is unavailable")
     data = await _json_body(request)
     target = data.get("group")
-    if not isinstance(target, (str, int)) or not str(target).strip():
+    if (
+      isinstance(target, bool)
+      or not isinstance(target, (str, int))
+      or not str(target).strip()
+    ):
       raise web.HTTPBadRequest(text="group is required")
     try:
       group = await self.group_adder(str(target).strip())
     except (TypeError, ValueError) as exc:
       raise web.HTTPBadRequest(text="invalid group") from exc
-    return web.json_response({"conversation": _conversation_json(group)}, status=201)
+    # The indexer returns legacy group state with history cursors, not a
+    # conversation row. Resolve its UUID instead of serializing missing fields.
+    conversation = await self.db.get_conversation(group["conversation_uuid"])
+    if conversation is None:
+      raise web.HTTPServiceUnavailable(text="group conversation is unavailable")
+    public_ids = await self._public_conversation_ids()
+    return web.json_response(
+      {
+        "conversation": {
+          **_conversation_json(conversation),
+          "is_public": conversation["id"] in public_ids,
+        }
+      },
+      status=201,
+      headers={"Cache-Control": "private, no-store"},
+    )
 
   async def public_revoke(self, request):
     await require_admin(request)
