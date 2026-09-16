@@ -125,6 +125,8 @@ Web API 支持账号密码登录和 JWT Bearer Token。未认证请求使用匿�
 
 全新数据库执行 `dbsetup.sql`。已有数据库按顺序执行尚未应用的 `migrations/001_access_control.sql`、`migrations/002_conversations.sql`、`migrations/003_message_history.sql`、`migrations/004_group_monitoring.sql`。升级前备份数据库并停止旧索引器及 Python Web 服务。`004` 首次为所有旧 `tg_groups` 登记的群保留手动监听引用，不公开或授权；不再需要的旧群需在管理接口取消手动引用。迁移重复执行不会复活已停用群，也不会接管之后创建的仅归档群。镜像更新不自动执行迁移。
 
+从原版 Luoxu 备份导入的旧消息可能没有保存回复关系，`reply_to_id=null` 不一定是真正的讨论起点。可使用[手动回复关系回填工具](docs/reply-backfill.md)先预览、再限速分批补全；不改正文、授权或常规历史游标，支持断点续跑。此次修复不需要新的 SQL 迁移，更新镜像不会自动执行回填。
+
 未启用 Topics 的群若出现大量同名 `topic`，请参阅[普通回复误分类修复说明](docs/topic-repair.md)。此次修复不需要新的 SQL 结构迁移；备份后，将确认未使用 Topics 的群 ID 加入 `telegram.repair_non_forum_groups`，更新并重启索引器后会在初始化这些群时自动归并旧数据。
 
 Docker
