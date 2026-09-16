@@ -10,6 +10,7 @@ class SearchQuery(NamedTuple):
   end: datetime.datetime | None
   conversation_id: str | None = None
   exclude_sender: list[int] | None = None
+  include_deleted: bool = False
 
 
 class GroupNotFound(Exception):

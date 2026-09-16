@@ -201,6 +201,10 @@ class SearchHandler(BaseHandler):
   async def _get(self, request):
     try:
       q = self._parse_query(request.query)
+      if q.include_deleted and not request.app["history_enabled"]:
+        raise web.HTTPBadRequest(
+          text="include_deleted requires message history enabled"
+        )
       groupinfo, messages = await self.dbconn.search(q, request["principal"])
     except (ValueError, TypeError, KeyError) as exc:
       raise web.HTTPBadRequest from exc
@@ -217,14 +221,24 @@ class SearchHandler(BaseHandler):
             "from_id": m["from_user"],
             "from_name": m["from_user_name"],
             "group_id": m["group_id"],
-            "html": html_or_text(m),
+            "html": html_or_text(m) if m["text"] is not None else None,
             "t": m["created_at"].timestamp(),
             "edited": m["updated_at"].timestamp() if m["updated_at"] else None,
+            "deleted": m["deleted_at"] is not None,
+            "deleted_at": m["deleted_at"].timestamp() if m["deleted_at"] else None,
+            "content_source": m["content_source"],
+            "snapshot_captured_at": (
+              m["snapshot_captured_at"].timestamp()
+              if m["snapshot_captured_at"]
+              else None
+            ),
           }
           for m in messages
         ],
       },
-      headers={"Cache-Control": "max-age=0"},
+      headers={
+        "Cache-Control": "private, no-store" if q.include_deleted else "max-age=0"
+      },
     )
 
   def _parse_query(self, query):
@@ -239,7 +253,19 @@ class SearchHandler(BaseHandler):
     )
     end = util.fromtimestamp(_int(query["end"], "end")) if query.get("end") else None
     exclude_sender = self._parse_sender(query.get("exclude_sender"))
-    return SearchQuery(group, terms, sender, start, end, conversation_id, exclude_sender)
+    include_deleted = query.get("include_deleted", "false").lower()
+    if include_deleted not in ("true", "false"):
+      raise web.HTTPBadRequest(text="include_deleted must be true or false")
+    return SearchQuery(
+      group,
+      terms,
+      sender,
+      start,
+      end,
+      conversation_id,
+      exclude_sender,
+      include_deleted == "true",
+    )
 
   @staticmethod
   def _parse_sender(sender):

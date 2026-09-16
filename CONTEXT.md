@@ -46,4 +46,7 @@ A named discussion area in a Telegram group with Topics enabled. Ordinary messag
 The nearby conversation needed to understand a selected message. The chronological window stays within the same topic. Its discussion thread starts from earlier replied-to originals and includes later replies and parallel branches, independently of search matches or the window. Only currently accessible local messages from the same Telegram peer are eligible; inaccessible or missing originals remain opaque placeholders. Depth/count limits and unavailable/deleted content are reported explicitly; local completeness never asserts completeness of Telegram history.
 
 **Message change record**:
-A historical record that preserves a message's prior state when Telegram edits or deletes it; it is distinct from the current searchable message state. The capability is disabled by default and must be requested explicitly when enabled.
+A historical record that preserves a message's prior state when Telegram edits or deletes it; it is distinct from the current message state. The capability is disabled by default and must be requested explicitly when enabled.
+
+**Deleted-message search result**:
+An explicitly included deleted archive message, showing its saved pre-deletion snapshot when available and otherwise only a deletion marker. It remains subject to current conversation access and never represents restored current content.

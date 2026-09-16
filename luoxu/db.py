@@ -834,6 +834,8 @@ class PostgreStore:
       )
 
   async def search(self, q: SearchQuery, principal: Principal):
+    if q.include_deleted and not self.history_enabled:
+      raise ValueError("include_deleted requires message history enabled")
     async with self.get_conn() as conn:
       allowed = await self._accessible_ids(conn, principal)
       if q.group:
@@ -871,6 +873,10 @@ class PostgreStore:
 
   async def _search_one_year(self, q, date_start, date_end, limit, principal):
     async with self.get_conn() as conn:
+      if q.include_deleted:
+        # Set before the first read in this transaction. Both sources must see
+        # the same snapshot, even if core commits a deletion between the reads.
+        await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
       allowed = await self._accessible_ids(conn, principal)
       query = text_to_query(q.terms.strip()) if q.terms else None
       if q.terms and not query:
@@ -878,7 +884,9 @@ class PostgreStore:
       rows = await conn.fetch(
         """
         SELECT m.msgid, m.conversation_id, m.group_id, m.from_user,
-          m.from_user_name, m.created_at, m.updated_at, m.text, c.telegram_peer_id
+          m.from_user_name, m.created_at, m.updated_at, m.text, c.telegram_peer_id,
+          m.deleted_at, 'current'::text AS content_source,
+          NULL::timestamptz AS snapshot_captured_at
         FROM messages m JOIN conversations c ON c.id = m.conversation_id
         WHERE m.deleted_at IS NULL AND m.conversation_id = ANY($1::uuid[])
           AND m.created_at > $2 AND m.created_at < $3
@@ -900,30 +908,66 @@ class PostgreStore:
         max(0, limit),
         q.exclude_sender,
       )
-      highlight_query = query
-      if highlight_query and rows:
-        # Highlight only the limited result set, avoiding a full-table highlight.
-        by_id = {(r["conversation_id"], r["msgid"]): r for r in rows}
+      if q.include_deleted:
+        # Keep the default live-text query/index path unchanged. Each source is
+        # bounded before merging, then the combined page is limited once more.
+        deleted_rows = await conn.fetch(
+          """
+          SELECT m.msgid, m.conversation_id, m.group_id, m.from_user,
+            m.from_user_name, m.created_at, m.updated_at, snapshot.text,
+            c.telegram_peer_id, m.deleted_at, snapshot.captured_at AS snapshot_captured_at,
+            CASE WHEN snapshot.id IS NULL THEN 'unavailable'
+                 ELSE 'delete_snapshot' END AS content_source
+          FROM messages m JOIN conversations c ON c.id = m.conversation_id
+          LEFT JOIN LATERAL (
+            SELECT r.id, r.text, r.captured_at FROM message_revisions r
+            WHERE r.conversation_id = m.conversation_id AND r.msgid = m.msgid
+              AND r.created_at = m.created_at AND r.revision_type = 'delete'
+            ORDER BY r.captured_at DESC, r.id DESC LIMIT 1
+          ) snapshot ON true
+          WHERE m.deleted_at IS NOT NULL AND m.conversation_id = ANY($1::uuid[])
+            AND m.created_at > $2 AND m.created_at < $3
+            AND ($4::bigint IS NULL OR m.group_id = $4)
+            AND ($5::uuid IS NULL OR m.conversation_id = $5)
+            AND ($6::text IS NULL OR snapshot.text &@~ $6)
+            AND ($7::bigint[] IS NULL OR m.from_user = ANY($7))
+            AND ($9::bigint[] IS NULL OR m.from_user IS NULL
+                 OR NOT (m.from_user = ANY($9)))
+          ORDER BY m.created_at DESC, m.msgid DESC LIMIT $8
+          """,
+          allowed or [],
+          date_start,
+          date_end,
+          q.group or None,
+          q.conversation_id,
+          query,
+          q.sender,
+          max(0, limit),
+          q.exclude_sender,
+        )
+        rows = sorted(
+          [*rows, *deleted_rows],
+          key=lambda row: (row["created_at"], row["msgid"]),
+          reverse=True,
+        )[: max(0, limit)]
+      if query and rows:
+        # Highlight exactly the authorized, limited texts already selected,
+        # including snapshots. Re-reading messages by ID would lose snapshots
+        # and could substitute a different physical (created_at) variant.
         highlighted = await conn.fetch(
           """
-          SELECT m.conversation_id, m.msgid, pgroonga_highlight_html(m.text,
+          SELECT pgroonga_highlight_html(selected.text,
             pgroonga_query_extract_keywords($1)) AS html
-          FROM messages m
-          JOIN unnest($3::uuid[], $4::bigint[]) AS selected(conversation_id, msgid)
-            ON selected.conversation_id = m.conversation_id
-           AND selected.msgid = m.msgid
-          WHERE m.conversation_id = ANY($2::uuid[])
-        """,
-          highlight_query,
-          allowed or [],
-          [row["conversation_id"] for row in rows],
-          [row["msgid"] for row in rows],
+          FROM unnest($2::text[]) WITH ORDINALITY AS selected(text, position)
+          ORDER BY selected.position
+          """,
+          query,
+          [row["text"] for row in rows],
         )
-        for row in highlighted:
-          key = (row["conversation_id"], row["msgid"])
-          if key in by_id:
-            by_id[key] = dict(by_id[key]) | {"html": row["html"]}
-        rows = [by_id[(r["conversation_id"], r["msgid"])] for r in rows]
+        rows = [
+          dict(row) | {"html": rendered["html"]}
+          for row, rendered in zip(rows, highlighted, strict=True)
+        ]
       return rows
 
   async def get_groups(self, principal: Principal):
