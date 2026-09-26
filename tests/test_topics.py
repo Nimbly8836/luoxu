@@ -19,6 +19,7 @@ from telethon.tl import types
 from telethon.tl.patched import Message
 
 from luoxu.auth import AuthService, Principal
+from luoxu.ctxvars import msg_source
 from luoxu.db import PostgreStore
 from luoxu.types import SearchQuery
 from luoxu.storage import archive_sql, conversation_archive
@@ -186,6 +187,307 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
       deleted,
       reply_to,
     )
+
+  async def archived_message(self, conversation_id, msgid, principal):
+    row = await self.db.get_message(conversation_id, msgid, principal)
+    assert row is not None
+    return row
+
+  async def test_history_replay_completes_legacy_reply_chain_without_reverting_message(
+    self,
+  ):
+    edited = datetime.datetime(2025, 1, 3, tzinfo=UTC)
+    async with self.db.get_conn() as conn:
+      await self.seed_message(conn, self.parent_id, 50, text="earlier original")
+      await self.seed_message(
+        conn, self.parent_id, 200, text="saved edited text", edited=edited
+      )
+      await self.seed_message(conn, self.parent_id, 201, reply_to=200)
+    await self.db.grant_public(self.parent_id)
+    principal = Principal(None, None)
+    before = dict(await self.archived_message(self.parent_id, 200, principal))
+    self.db.history_enabled = True
+    incoming = message(200, reply_id=50)
+    incoming.edit_date = edited
+    incoming.message = "replayed body must not overwrite saved text"
+    token = msg_source.set("history")
+    try:
+      await self.db.insert_messages([incoming], UpdateLoaded.update_none, use_ocr=False)
+    finally:
+      msg_source.reset(token)
+    after = dict(await self.archived_message(self.parent_id, 200, principal))
+    self.assertEqual(after.pop("reply_to_id"), 50)
+    before.pop("reply_to_id")
+    self.assertEqual(after, before, "only the missing parent link should change")
+    self.assertEqual(await self.db.get_revisions(self.parent_id, 200, principal), [])
+    paths = [
+      f"/api/luoxu/context?g={GROUP_ID}&id=201&before=0&after=0",
+      f"/api/luoxu/conversations/{self.parent_id}/messages/201/context?before=0&after=0",
+    ]
+    async with self.api_client() as client:
+      bodies = []
+      for path in paths:
+        response = await client.get(path)
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertEqual([row["id"] for row in body["replies"]], [200, 50])
+        self.assertEqual(body["replies"][0]["text"], "saved edited text")
+        self.assertTrue(body["replies_meta"]["complete"])
+        bodies.append(body)
+      self.assertEqual(bodies[0], bodies[1])
+
+  async def test_explicit_reply_backfill_is_metadata_only_and_idempotent(self):
+    edited = datetime.datetime(2025, 1, 3, tzinfo=UTC)
+    async with self.db.get_conn() as conn:
+      await self.seed_message(conn, self.parent_id, 50, text="earlier original")
+      await self.seed_message(
+        conn, self.parent_id, 200, text="saved edited text", edited=edited
+      )
+      await self.seed_message(conn, self.parent_id, 201, reply_to=200)
+      await self.seed_message(conn, self.parent_id, 202, text="", deleted=edited)
+      await self.seed_message(conn, self.parent_id, 203, reply_to=99)
+      await self.seed_message(conn, self.parent_id, 204)
+    await self.db.grant_public(self.parent_id)
+    principal = Principal(None, None)
+    before = {
+      mid: dict(await self.archived_message(self.parent_id, mid, principal))
+      for mid in (200, 202, 203, 204)
+    }
+    self.db.history_enabled = True
+    self.assertEqual(await self.db.reply_backfill_upper_bound(self.parent_id), 204)
+    self.assertEqual(
+      await self.db.reply_backfill_candidates(self.parent_id, 0, 204, 100),
+      [50, 200, 204],
+    )
+    incoming = [message(mid, reply_id=50) for mid in (200, 202, 203)]
+    incoming.append(message(204, reply_id=None))
+    self.assertEqual(
+      await self.db.backfill_reply_ids(self.parent_id, incoming, dry_run=True), 1
+    )
+    self.assertEqual(
+      dict(await self.archived_message(self.parent_id, 200, principal)), before[200]
+    )
+    self.assertEqual(await self.db.backfill_reply_ids(self.parent_id, incoming), 1)
+    self.assertEqual(await self.db.backfill_reply_ids(self.parent_id, incoming), 0)
+    for mid, original in before.items():
+      expected = dict(original)
+      if mid == 200:
+        expected["reply_to_id"] = 50
+      self.assertEqual(
+        dict(await self.archived_message(self.parent_id, mid, principal)), expected
+      )
+      self.assertEqual(await self.db.get_revisions(self.parent_id, mid, principal), [])
+    self.assertEqual(
+      await self.db.reply_backfill_candidates(self.parent_id, 50, 204, 100), [204]
+    )
+
+  async def test_incomplete_replay_does_not_erase_a_recovered_reply(self):
+    async with self.db.get_conn() as conn:
+      await self.seed_message(conn, self.parent_id, 50)
+      await self.seed_message(conn, self.parent_id, 200)
+    await self.db.grant_public(self.parent_id)
+    self.assertEqual(
+      await self.db.backfill_reply_ids(self.parent_id, [message(200, reply_id=50)]), 1
+    )
+    token = msg_source.set("history")
+    try:
+      await self.db.insert_messages(
+        [message(200, reply_id=None)], UpdateLoaded.update_none, use_ocr=False
+      )
+    finally:
+      msg_source.reset(token)
+    row = await self.archived_message(self.parent_id, 200, Principal(None, None))
+    self.assertEqual(row["reply_to_id"], 50)
+
+  async def test_stale_edit_fills_parent_without_creating_a_revision(self):
+    edited = datetime.datetime(2025, 1, 3, tzinfo=UTC)
+    async with self.db.get_conn() as conn:
+      await self.seed_message(conn, self.parent_id, 50)
+      for mid in (200, 201):
+        await self.seed_message(
+          conn, self.parent_id, mid, text="current body", edited=edited
+        )
+    await self.db.grant_public(self.parent_id)
+    principal = Principal(None, None)
+    self.db.history_enabled = True
+    for mid, incoming_date in enumerate(
+      (edited - datetime.timedelta(hours=1), edited), start=200
+    ):
+      with self.subTest(incoming_date=incoming_date):
+        incoming = message(mid, reply_id=50)
+        incoming.edit_date = incoming_date
+        token = msg_source.set("editmsg")
+        try:
+          await self.db.insert_messages(
+            [incoming], UpdateLoaded.update_none, use_ocr=False
+          )
+        finally:
+          msg_source.reset(token)
+        row = await self.archived_message(self.parent_id, mid, principal)
+        self.assertEqual(row["reply_to_id"], 50)
+        self.assertEqual(row["text"], "current body")
+        self.assertEqual(row["updated_at"], edited)
+        self.assertEqual(
+          await self.db.get_revisions(self.parent_id, mid, principal), []
+        )
+
+  async def test_reply_backfill_rejects_foreign_peer_before_any_batch_write(self):
+    async with self.db.get_conn() as conn:
+      await self.seed_message(conn, self.parent_id, 200)
+    await self.db.grant_public(self.parent_id)
+    for peer in (types.PeerChat(GROUP_ID), types.PeerChannel(GROUP_ID + 1)):
+      with self.subTest(peer=peer), self.assertRaisesRegex(ValueError, "archived peer"):
+        await self.db.backfill_reply_ids(
+          self.parent_id,
+          [message(200, reply_id=50), message(201, peer=peer, reply_id=50)],
+        )
+      row = await self.archived_message(self.parent_id, 200, Principal(None, None))
+      self.assertIsNone(row["reply_to_id"])
+
+  async def test_reply_backfill_ignores_unsafe_headers_and_wrong_dates(self):
+    async with self.db.get_conn() as conn:
+      await self.seed_message(conn, self.parent_id, 200)
+    await self.db.grant_public(self.parent_id)
+    principal = Principal(None, None)
+    original = dict(await self.archived_message(self.parent_id, 200, principal))
+    invalid = [message(200, reply_id=pid) for pid in (None, 0, -1, 200, 2**63, True)]
+    for peer in (types.PeerChat(GROUP_ID), types.PeerChannel(GROUP_ID + 1)):
+      incoming = message(200, reply_id=50)
+      incoming.reply_to = types.MessageReplyHeader(
+        reply_to_msg_id=50, reply_to_peer_id=peer
+      )
+      invalid.append(incoming)
+    wrong_date = message(200, reply_id=50)
+    wrong_date.date = datetime.datetime(2025, 1, 3, tzinfo=UTC)
+    invalid.append(wrong_date)
+    for incoming in invalid:
+      with self.subTest(header=incoming.reply_to, date=incoming.date):
+        self.assertEqual(
+          await self.db.backfill_reply_ids(self.parent_id, [incoming]), 0
+        )
+        self.assertEqual(
+          dict(await self.archived_message(self.parent_id, 200, principal)), original
+        )
+    explicit_local = message(200, reply_id=50)
+    explicit_local.reply_to = types.MessageReplyHeader(
+      reply_to_msg_id=50, reply_to_peer_id=types.PeerChannel(GROUP_ID)
+    )
+    self.assertEqual(
+      await self.db.backfill_reply_ids(self.parent_id, [explicit_local]), 1
+    )
+
+  async def test_reply_backfill_uses_latest_archive_variant_and_bounded_candidates(
+    self,
+  ):
+    async with self.db.get_conn() as conn:
+      await self.seed_message(conn, self.parent_id, 200, year=2025)
+      await self.seed_message(conn, self.parent_id, 200, year=2026)
+      await self.seed_message(conn, self.parent_id, 201, year=2025)
+      await self.seed_message(conn, self.parent_id, 201, year=2026, reply_to=50)
+      await self.seed_message(conn, self.parent_id, 202, year=2025)
+      await self.seed_message(
+        conn,
+        self.parent_id,
+        202,
+        year=2026,
+        deleted=datetime.datetime(2026, 2, 1, tzinfo=UTC),
+        text="",
+      )
+      await self.seed_message(conn, self.parent_id, 203)
+      topic = await self.seed_topic(conn, 42)
+    await self.db.grant_public(self.parent_id)
+    self.assertEqual(
+      await self.db.reply_backfill_candidates(self.parent_id, 0, 203, 100), [200, 203]
+    )
+    self.assertEqual(
+      await self.db.reply_backfill_candidates(self.parent_id, 0, 203, 1), [200]
+    )
+    self.assertEqual(
+      await self.db.reply_backfill_candidates(self.parent_id, 200, 202, 100), []
+    )
+    self.assertEqual(
+      await self.db.backfill_reply_ids(self.parent_id, [message(200, reply_id=50)]), 0
+    )
+    row = await self.archived_message(self.parent_id, 200, Principal(None, None))
+    self.assertIsNone(row["reply_to_id"])
+    for after, through, limit in (
+      (-1, 203, 1),
+      (204, 203, 1),
+      (0, 203, 0),
+      (0, 203, 101),
+    ):
+      with (
+        self.subTest(after=after, through=through, limit=limit),
+        self.assertRaises(ValueError),
+      ):
+        await self.db.reply_backfill_candidates(self.parent_id, after, through, limit)
+    for cid in (topic, uuid.uuid4()):
+      with (
+        self.subTest(cid=cid),
+        self.assertRaisesRegex(ValueError, "group conversation"),
+      ):
+        await self.db.backfill_reply_ids(cid, [])
+
+  async def test_topic_repair_preserves_recovered_parent_when_newer_copy_omits_it(self):
+    async with self.db.get_conn() as conn:
+      topic = await self.seed_topic(conn, 42)
+      await self.seed_message(
+        conn,
+        self.parent_id,
+        200,
+        reply_to=50,
+        text="older body",
+        edited=datetime.datetime(2025, 1, 3, tzinfo=UTC),
+      )
+      await self.seed_message(
+        conn,
+        topic,
+        200,
+        topic_id=42,
+        text="newer body",
+        edited=datetime.datetime(2025, 1, 4, tzinfo=UTC),
+      )
+    await self.db.grant_public(self.parent_id)
+    async with self.db.get_conn() as conn:
+      await self.db.insert_group(conn, channel())
+    row = await self.archived_message(self.parent_id, 200, Principal(None, None))
+    self.assertEqual(row["reply_to_id"], 50)
+    self.assertEqual(row["text"], "newer body")
+    self.assertIsNone(row["topic_id"])
+
+  async def test_topic_repair_recovers_parent_from_older_copy_without_reverting_body(
+    self,
+  ):
+    newer = datetime.datetime(2025, 1, 4, tzinfo=UTC)
+    async with self.db.get_conn() as conn:
+      topic = await self.seed_topic(conn, 42)
+      await self.seed_message(
+        conn, self.parent_id, 200, text="newer group body", edited=newer
+      )
+      await self.seed_message(
+        conn,
+        topic,
+        200,
+        topic_id=42,
+        reply_to=50,
+        text="older topic body",
+        edited=datetime.datetime(2025, 1, 3, tzinfo=UTC),
+      )
+      await self.seed_message(conn, self.parent_id, 201, text="", deleted=newer)
+      await self.seed_message(conn, topic, 201, topic_id=42, reply_to=50)
+    await self.db.grant_public(self.parent_id)
+    async with self.db.get_conn() as conn:
+      await self.db.insert_group(conn, channel())
+    principal = Principal(None, None)
+    row = await self.archived_message(self.parent_id, 200, principal)
+    self.assertEqual(row["reply_to_id"], 50)
+    self.assertEqual(row["text"], "newer group body")
+    self.assertEqual(row["updated_at"], newer)
+    self.assertEqual(await self.db.get_revisions(self.parent_id, 200, principal), [])
+    deleted = await self.archived_message(self.parent_id, 201, principal)
+    self.assertEqual(deleted["text"], "")
+    self.assertEqual(deleted["deleted_at"], newer)
+    self.assertIsNone(deleted["reply_to_id"])
 
   async def test_ordinary_reply_ingestion_lists_only_one_group(self):
     msgs = [message(402900 + i, top_id=402800 + i) for i in range(4)]

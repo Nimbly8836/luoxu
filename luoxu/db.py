@@ -373,6 +373,24 @@ class PostgreStore:
 
   async def _merge_topic_messages(self, conn, parent_id, topic_id, group_id):
     conn = await self.archive_conn(conn, parent_id)
+    # An older duplicate can contain a parent that the newer body never stored.
+    # Recover only that missing field before removing the topic copy; keep the
+    # original deletion/content winner rules below and the enclosing repair lock.
+    # Fixed SQL; both conversation IDs are separately bound parameters.
+    # pi-lens-ignore: python-sql-injection
+    await conn.execute(
+      """
+      UPDATE {messages} AS destination SET reply_to_id = source.reply_to_id
+      FROM {messages} AS source
+      WHERE destination.conversation_id = $1 AND source.conversation_id = $2
+        AND destination.msgid = source.msgid
+        AND destination.created_at = source.created_at
+        AND destination.reply_to_id IS NULL AND destination.deleted_at IS NULL
+        AND source.reply_to_id > 0 AND source.reply_to_id <> source.msgid
+      """,
+      parent_id,
+      topic_id,
+    )
     # Move atomically within the peer's ordinary table. Replayed duplicates may
     # already exist in the parent; retain the latest state and never resurrect
     # a deletion. This repair does not create new historical snapshots.
@@ -394,7 +412,8 @@ class PostgreStore:
       FROM moved ORDER BY created_at, msgid
       ON CONFLICT (conversation_id, msgid, created_at) DO UPDATE SET
         group_id = EXCLUDED.group_id, topic_id = NULL,
-        reply_to_id = EXCLUDED.reply_to_id, quote_text = EXCLUDED.quote_text,
+        reply_to_id = coalesce(EXCLUDED.reply_to_id, {messages}.reply_to_id),
+        quote_text = EXCLUDED.quote_text,
         from_user = EXCLUDED.from_user, from_user_name = EXCLUDED.from_user_name,
         text = EXCLUDED.text, media = EXCLUDED.media,
         updated_at = EXCLUDED.updated_at, deleted_at = EXCLUDED.deleted_at
@@ -452,6 +471,43 @@ class PostgreStore:
   def _reply_to_id(msg):
     reply = getattr(msg, "reply_to", None)
     return getattr(reply, "reply_to_msg_id", None) if reply else None
+
+  @classmethod
+  def _local_reply_id(cls, msg) -> int | None:
+    reply_id = cls._reply_to_id(msg)
+    if type(reply_id) is not int or not 0 < reply_id < 2**63 or reply_id == msg.id:
+      return None
+    reply_peer = getattr(getattr(msg, "reply_to", None), "reply_to_peer_id", None)
+    if reply_peer is not None and reply_peer != msg.peer_id:
+      # A foreign-peer quote must not become a same-ID local parent link.
+      return None
+    return reply_id
+
+  async def _fill_missing_reply_id(self, conn, old, msg, *, dry_run=False) -> bool:
+    if (
+      old["deleted_at"] is not None
+      or old["reply_to_id"] is not None
+      or old["created_at"] != msg.date
+    ):
+      return False
+    reply_id = self._local_reply_id(msg)
+    if reply_id is None:
+      return False
+    if dry_run:
+      return True
+    changed = await conn.fetchval(
+      """
+      UPDATE {messages} SET reply_to_id = $4
+      WHERE conversation_id = $1 AND msgid = $2 AND created_at = $3
+        AND reply_to_id IS NULL AND deleted_at IS NULL
+      RETURNING true
+      """,
+      old["conversation_id"],
+      old["msgid"],
+      old["created_at"],
+      reply_id,
+    )
+    return bool(changed)
 
   @staticmethod
   def _quote_text(msg):
@@ -534,12 +590,14 @@ class PostgreStore:
     incoming_edit = msg_source.get() == "editmsg"
     if old and old["deleted_at"]:
       return
-    # Startup history replay must not overwrite a newer edit or restore a
-    # message that was deleted while the indexer was offline.
+    # Preserve newer content, but legacy archives may still lack the immutable
+    # parent link. Fill only that field from a matching local-peer reply header.
     if old and not incoming_edit and old["updated_at"] is not None:
+      await self._fill_missing_reply_id(conn, old, msg)
       return
     if old and incoming_edit:
       if msg.edit_date and old["updated_at"] and msg.edit_date <= old["updated_at"]:
+        await self._fill_missing_reply_id(conn, old, msg)
         return
       if self.history_enabled:
         await self._save_revision(conn, old, "edit")
@@ -560,7 +618,8 @@ class PostgreStore:
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL)
       ON CONFLICT (conversation_id, msgid, created_at) DO UPDATE SET
         text = EXCLUDED.text, updated_at = EXCLUDED.updated_at,
-        reply_to_id = EXCLUDED.reply_to_id, quote_text = EXCLUDED.quote_text,
+        reply_to_id = coalesce(EXCLUDED.reply_to_id, {messages}.reply_to_id),
+        quote_text = EXCLUDED.quote_text,
         media = EXCLUDED.media, deleted_at = NULL
     """,
       conversation["id"],
@@ -612,6 +671,97 @@ class PostgreStore:
         first = data[0][2]["legacy_group_id"]
         if first:
           await self.loaded_upto(conn, first, -1, formatted[0][0].id)
+
+  async def _reply_backfill_group(self, conn, conversation_id):
+    group = await conn.fetchrow(
+      """
+      SELECT * FROM conversations WHERE id = $1 AND kind = 'group'
+        AND telegram_peer_type IN ('chat', 'channel')
+      """,
+      conversation_id,
+    )
+    if group is None:
+      raise ValueError("reply backfill requires an existing group conversation")
+    return group
+
+  async def reply_backfill_upper_bound(self, conversation_id) -> int:
+    """Bound an explicit operator-maintenance job; not a content API."""
+    async with self.get_conn() as conn:
+      await self._reply_backfill_group(conn, conversation_id)
+      conn = await self.archive_conn(conn, conversation_id)
+      return await conn.fetchval(
+        "SELECT coalesce(max(msgid), 0) FROM {messages} WHERE conversation_id = $1",
+        conversation_id,
+      )
+
+  async def reply_backfill_candidates(
+    self, conversation_id, after_id: int, through_id: int, limit: int
+  ) -> list[int]:
+    if (
+      type(after_id) is not int
+      or type(through_id) is not int
+      or not 0 <= after_id <= through_id < 2**63
+      or type(limit) is not int
+      or not 1 <= limit <= 100
+    ):
+      raise ValueError("invalid reply backfill range or batch size")
+    async with self.get_conn() as conn:
+      await self._reply_backfill_group(conn, conversation_id)
+      conn = await self.archive_conn(conn, conversation_id)
+      rows = await conn.fetch(
+        """
+        SELECT msgid FROM (
+          SELECT DISTINCT ON (msgid) msgid, reply_to_id, deleted_at
+          FROM {messages} WHERE conversation_id = $1 AND msgid > $2 AND msgid <= $3
+          ORDER BY msgid, created_at DESC
+        ) latest
+        WHERE reply_to_id IS NULL AND deleted_at IS NULL
+        ORDER BY msgid LIMIT $4
+        """,
+        conversation_id,
+        after_id,
+        through_id,
+        limit,
+      )
+      return [row["msgid"] for row in rows]
+
+  async def backfill_reply_ids(
+    self, conversation_id, messages, *, dry_run=False
+  ) -> int:
+    """Fill missing parent IDs only, from verified Telegram message objects.
+
+    This is an explicit operator-maintenance interface, not an HTTP permission
+    bypass. It creates no messages/conversations and changes no other metadata.
+    """
+    messages = list(messages)
+    if len(messages) > 100:
+      raise ValueError("reply backfill batches cannot exceed 100 messages")
+    changed = 0
+    async with self.get_conn() as conn:
+      group = await self._reply_backfill_group(conn, conversation_id)
+      expected_peer = (group["telegram_peer_type"], group["telegram_peer_id"])
+      for msg in messages:
+        if (
+          not isinstance(msg, types.Message)
+          or self._peer_info(msg)[1:3] != expected_peer
+        ):
+          raise ValueError("reply backfill message does not match the archived peer")
+        if type(msg.id) is not int or not 0 < msg.id < 2**63:
+          raise ValueError("invalid reply backfill message ID")
+      await self._lock_peer_writes(conn, group["telegram_peer_id"], exclusive=True)
+      conn = ArchiveConnection(conn, group["archive_id"])
+      for msg in sorted(messages, key=lambda item: item.id):
+        old = await conn.fetchrow(
+          """
+          SELECT * FROM {messages} WHERE conversation_id = $1 AND msgid = $2
+          ORDER BY created_at DESC LIMIT 1 FOR UPDATE
+          """,
+          conversation_id,
+          msg.id,
+        )
+        if old is not None:
+          changed += await self._fill_missing_reply_id(conn, old, msg, dry_run=dry_run)
+    return changed
 
   async def delete_messages(
     self,
@@ -760,8 +910,15 @@ class PostgreStore:
     return ArchiveConnection(conn, target["archive_id"]), allowed or [], info
 
   async def search(self, q: SearchQuery, principal: Principal):
+    if q.include_deleted and q.mode == "semantic":
+      raise ValueError("include_deleted is not supported for semantic search")
+    if q.include_deleted and not self.history_enabled:
+      raise ValueError("include_deleted requires message history enabled")
     # Resolve and authorize before model calls or physical table routing.
     async with self.get_conn() as conn:
+      if q.include_deleted:
+        # Isolation must precede ACL/routing reads as well as both content reads.
+        await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
       scoped, allowed, groupinfo = await self._search_scope(conn, q, principal)
       if q.mode == "keyword":
         return groupinfo, await self._search_keywords(scoped, q, allowed)
@@ -788,7 +945,9 @@ class PostgreStore:
     rows = await conn.fetch(
       """
       SELECT m.msgid, m.conversation_id, m.group_id, m.from_user,
-        m.from_user_name, m.created_at, m.updated_at, m.text, c.telegram_peer_id
+        m.from_user_name, m.created_at, m.updated_at, m.text, c.telegram_peer_id,
+        m.deleted_at, 'current'::text AS content_source,
+        NULL::timestamptz AS snapshot_captured_at
       FROM {messages} m JOIN conversations c ON c.id = m.conversation_id
       WHERE m.deleted_at IS NULL AND m.conversation_id = ANY($1::uuid[])
         AND ($2::timestamptz IS NULL OR m.created_at > $2)
@@ -801,29 +960,77 @@ class PostgreStore:
              OR NOT (m.from_user = ANY($9)))
       ORDER BY m.created_at DESC, m.msgid DESC LIMIT $8
       """,
-      allowed, q.start, q.end, q.group or None, q.conversation_id,
-      query, q.sender, self.SEARCH_LIMIT, q.exclude_sender,
+      allowed or [],
+      q.start,
+      q.end,
+      q.group or None,
+      q.conversation_id,
+      query,
+      q.sender,
+      self.SEARCH_LIMIT,
+      q.exclude_sender,
     )
+    if q.include_deleted:
+      # Keep the default live-text query/index path unchanged. Each source is
+      # bounded before merging, then the combined page is limited once more.
+      deleted_rows = await conn.fetch(
+        """
+        SELECT m.msgid, m.conversation_id, m.group_id, m.from_user,
+          m.from_user_name, m.created_at, m.updated_at, snapshot.text,
+          c.telegram_peer_id, m.deleted_at, snapshot.captured_at AS snapshot_captured_at,
+          CASE WHEN snapshot.id IS NULL THEN 'unavailable'
+               ELSE 'delete_snapshot' END AS content_source
+        FROM {messages} m JOIN conversations c ON c.id = m.conversation_id
+        LEFT JOIN LATERAL (
+          SELECT r.id, r.text, r.captured_at FROM message_revisions r
+          WHERE r.conversation_id = m.conversation_id AND r.msgid = m.msgid
+            AND r.created_at = m.created_at AND r.revision_type = 'delete'
+          ORDER BY r.captured_at DESC, r.id DESC LIMIT 1
+        ) snapshot ON true
+        WHERE m.deleted_at IS NOT NULL AND m.conversation_id = ANY($1::uuid[])
+          AND ($2::timestamptz IS NULL OR m.created_at > $2)
+          AND ($3::timestamptz IS NULL OR m.created_at < $3)
+          AND ($4::bigint IS NULL OR m.group_id = $4)
+          AND ($5::uuid IS NULL OR m.conversation_id = $5)
+          AND ($6::text IS NULL OR snapshot.text &@~ $6)
+          AND ($7::bigint[] IS NULL OR m.from_user = ANY($7))
+          AND ($9::bigint[] IS NULL OR m.from_user IS NULL
+               OR NOT (m.from_user = ANY($9)))
+        ORDER BY m.created_at DESC, m.msgid DESC LIMIT $8
+        """,
+        allowed or [],
+        q.start,
+        q.end,
+        q.group or None,
+        q.conversation_id,
+        query,
+        q.sender,
+        self.SEARCH_LIMIT,
+        q.exclude_sender,
+      )
+      rows = sorted(
+        [*rows, *deleted_rows],
+        key=lambda row: (row["created_at"], row["msgid"]),
+        reverse=True,
+      )[: self.SEARCH_LIMIT]
     if query and rows:
-      by_id = {(r["conversation_id"], r["msgid"], r["created_at"]): r for r in rows}
+      # Highlight exactly the authorized, limited texts already selected,
+      # including snapshots. Re-reading messages by ID would lose snapshots
+      # and could substitute a different physical (created_at) variant.
       highlighted = await conn.fetch(
         """
-        SELECT m.conversation_id, m.msgid, m.created_at,
-          pgroonga_highlight_html(m.text, pgroonga_query_extract_keywords($1)) AS html
-        FROM {messages} m
-        JOIN unnest($3::uuid[], $4::bigint[], $5::timestamptz[]) AS selected(conversation_id, msgid, created_at)
-          ON selected.conversation_id = m.conversation_id
-         AND selected.msgid = m.msgid AND selected.created_at = m.created_at
-        WHERE m.conversation_id = ANY($2::uuid[])
+        SELECT pgroonga_highlight_html(selected.text,
+          pgroonga_query_extract_keywords($1)) AS html
+        FROM unnest($2::text[]) WITH ORDINALITY AS selected(text, position)
+        ORDER BY selected.position
         """,
-        query, allowed, [r["conversation_id"] for r in rows],
-        [r["msgid"] for r in rows], [r["created_at"] for r in rows],
+        query,
+        [row["text"] for row in rows],
       )
-      for row in highlighted:
-        key = (row["conversation_id"], row["msgid"], row["created_at"])
-        if key in by_id:
-          by_id[key] = dict(by_id[key]) | {"html": row["html"]}
-      rows = [by_id[(r["conversation_id"], r["msgid"], r["created_at"])] for r in rows]
+      rows = [
+        dict(row) | {"html": rendered["html"]}
+        for row, rendered in zip(rows, highlighted, strict=True)
+      ]
     return rows
 
   async def get_groups(self, principal: Principal):

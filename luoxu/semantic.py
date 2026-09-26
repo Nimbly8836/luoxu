@@ -94,6 +94,8 @@ async def search_vectors(conn, q, allowed, vector, limit):
     """
     SELECT m.msgid, m.conversation_id, m.group_id, m.from_user,
       m.from_user_name, m.created_at, m.updated_at, m.text,
+      m.deleted_at, 'current'::text AS content_source,
+      NULL::timestamptz AS snapshot_captured_at,
       1 - (e.embedding <=> $1::text::vector) AS score
     FROM {messages} m JOIN {embeddings} e
       ON e.conversation_id = m.conversation_id AND e.msgid = m.msgid

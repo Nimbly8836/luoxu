@@ -51,6 +51,13 @@ class QueryTests(unittest.TestCase):
     handler = SearchHandler(None)
     self.assertEqual(handler._parse_query({"g": "123"}).mode, "keyword")
     self.assertEqual(SearchQuery(0, None, None, None, None).offset, 0)
+    # New optional fields must not shift the existing semantic positional API.
+    positional = SearchQuery(123, "job", None, None, None, None, None, "semantic", 50)
+    self.assertEqual((positional.mode, positional.offset, positional.include_deleted),
+                     ("semantic", 50, False))
+    deleted = handler._parse_query({"g": "123", "include_deleted": "true"})
+    self.assertEqual((deleted.mode, deleted.offset, deleted.include_deleted),
+                     ("keyword", 0, True))
     q = handler._parse_query({
       "mode": "semantic", "q": "工作压力", "sender": "1,2",
       "exclude_sender": "2,3", "offset": "50",
@@ -69,6 +76,7 @@ class QueryTests(unittest.TestCase):
       {"mode": "semantic", "q": "x" * 2001},
       {"mode": "semantic", "q": "x", "offset": "-1"},
       {"mode": "semantic", "q": "x", "offset": "1001"},
+      {"mode": "semantic", "q": "x", "include_deleted": "true"},
       {"offset": "1"}, {"start": "200", "end": "100"},
     ):
       with self.subTest(params=params), self.assertRaises(web.HTTPBadRequest):
@@ -336,6 +344,29 @@ class SemanticDatabaseTests(unittest.IsolatedAsyncioTestCase):
       await conn.execute(f"DELETE FROM {self.messages} WHERE msgid = 3")
       self.assertEqual(await conn.fetchval(f"SELECT count(*) FROM {self.embeddings}"), 0)
 
+  async def test_deleted_snapshots_are_not_indexed_and_semantic_opt_in_is_rejected(self):
+    self.db.history_enabled = True
+    await self.seed(1)
+    await self.seed(2)
+    await self.backfill()
+    await self.db.delete_messages(123, [1], peer_type="channel")
+    await self.backfill()
+    self.assertEqual([r["msgid"] for r in await self.search()], [2])
+    async with self.db.get_conn() as conn:
+      self.assertEqual(await conn.fetchval("SELECT count(*) FROM message_revisions"), 1)
+      self.assertEqual(await conn.fetchval(f"SELECT count(*) FROM {self.embeddings}"), 1)
+    with self.assertRaisesRegex(ValueError, "not supported for semantic"):
+      await self.search(include_deleted=True)
+    app = setup_app(self.db, None, "/tmp", "nobody.jpg", "ghost.jpg", history_enabled=True)
+    async with TestClient(TestServer(app)) as client:
+      response = await client.get("/search?g=123&mode=semantic&q=job&include_deleted=true")
+      self.assertEqual(response.status, 400)
+      response = await client.get("/search?g=123&q=job&include_deleted=true")
+      self.assertEqual(response.status, 200)
+      body = await response.json()
+      self.assertEqual({m["id"] for m in body["messages"]}, {1, 2})
+      self.assertEqual(sum(m["deleted"] for m in body["messages"]), 1)
+
   async def test_change_during_inference_does_not_save_stale_vector(self):
     await self.seed(1)
 
@@ -383,6 +414,11 @@ class SemanticDatabaseTests(unittest.IsolatedAsyncioTestCase):
       self.assertEqual(body["mode"], "semantic")
       self.assertEqual(body["messages"][0]["html"], "&lt;script&gt;job&lt;/script&gt;")
       self.assertAlmostEqual(body["messages"][0]["score"], 1)
+      for message in body["messages"]:
+        self.assertFalse(message["deleted"])
+        self.assertIsNone(message["deleted_at"])
+        self.assertEqual(message["content_source"], "current")
+        self.assertIsNone(message["snapshot_captured_at"])
       self.assertEqual(response.headers["Cache-Control"], "private, no-store")
       second = await client.get("/search?g=123&mode=semantic&q=job&offset=50")
       page = await second.json()

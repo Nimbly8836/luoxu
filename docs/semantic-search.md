@@ -18,7 +18,7 @@ curl -G http://localhost:9008/luoxu/search \
   --data-urlencode 'exclude_sender=789,987'
 ```
 
-- `mode=keyword` 或不传：原有关键词搜索和时间排序，响应字段不变。
+- `mode=keyword` 或不传：原有关键词搜索和时间排序。
 - `mode=semantic`：`q` 必须是非空自然语言，最多 2000 字符。此时 `OR`、减号等不是关键词运算符。
 - 必须指定 `g` 或 `conversation_id`，只查该群/私聊的独立表，不提供跨群搜索。
   未指定目标返回 400，无权限/不存在的目标返回 404。`sender`、`exclude_sender`、
@@ -32,6 +32,8 @@ curl -G http://localhost:9008/luoxu/search \
   `offset` 最大 1000；翻页保持查询和过滤条件不变。归档或权限变化时页面可能移动。
 - 普通模式不接受非零 `offset`。非法模式、空语义查询及不合法分页返回 400。
 - 功能关闭、缺少迁移或模型服务暂不可用/繁忙时返回 503 和 `error`，不会偷偷降级为关键词搜索。
+- 语义模式不索引或检索删除快照，`mode=semantic&include_deleted=true` 返回 400。需要搜索删除前正文时，使用[关键词删除快照搜索](deleted-message-search.md)。
+- 两种模式均返回来源字段；语义结果始终是 `deleted=false`、`deleted_at=null`、`content_source=current`、`snapshot_captured_at=null`。
 
 权限过滤在数据库排名/分页之前执行，管理员在内容接口也不绕过授权。
 私聊、Topics 和已撤销授权的会话遵循现有访问规则，返回的消息可以继续调用上下文接口。

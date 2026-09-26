@@ -12,6 +12,7 @@ class SearchQuery(NamedTuple):
   exclude_sender: list[int] | None = None
   mode: str = "keyword"
   offset: int = 0
+  include_deleted: bool = False
 
 
 class GroupNotFound(Exception):

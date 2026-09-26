@@ -202,6 +202,10 @@ class SearchHandler(BaseHandler):
   async def _get(self, request):
     try:
       q = self._parse_query(request.query)
+      if q.include_deleted and not request.app["history_enabled"]:
+        raise web.HTTPBadRequest(
+          text="include_deleted requires message history enabled"
+        )
       groupinfo, messages = await self.dbconn.search(q, request["principal"])
     except (ValueError, TypeError, KeyError) as exc:
       raise web.HTTPBadRequest from exc
@@ -233,10 +237,18 @@ class SearchHandler(BaseHandler):
             "from_id": m["from_user"],
             "from_name": m["from_user_name"],
             "group_id": m["group_id"],
-            "html": html_or_text(m),
+            "html": html_or_text(m) if m["text"] is not None else None,
             "t": m["created_at"].timestamp(),
             "edited": m["updated_at"].timestamp() if m["updated_at"] else None,
             **({"score": m["score"]} if semantic else {}),
+            "deleted": m["deleted_at"] is not None,
+            "deleted_at": m["deleted_at"].timestamp() if m["deleted_at"] else None,
+            "content_source": m["content_source"],
+            "snapshot_captured_at": (
+              m["snapshot_captured_at"].timestamp()
+              if m["snapshot_captured_at"]
+              else None
+            ),
           }
           for m in messages[:limit]
         ],
@@ -270,8 +282,18 @@ class SearchHandler(BaseHandler):
       raise web.HTTPBadRequest(text="semantic q must contain 1-2000 characters")
     if start and end and start >= end:
       raise web.HTTPBadRequest(text="start must be before end")
+    include_deleted = query.get("include_deleted", "false").lower()
+    if include_deleted not in ("true", "false"):
+      raise web.HTTPBadRequest(text="include_deleted must be true or false")
+    if mode == "semantic" and include_deleted == "true":
+      raise web.HTTPBadRequest(text="include_deleted is not supported for semantic search")
     return SearchQuery(
-      group, terms, sender, start, end, conversation_id, exclude_sender, mode, offset
+      group, terms, sender, start, end,
+      conversation_id=conversation_id,
+      exclude_sender=exclude_sender,
+      mode=mode,
+      offset=offset,
+      include_deleted=include_deleted == "true",
     )
 
   @staticmethod
