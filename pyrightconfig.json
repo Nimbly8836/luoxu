@@ -1,0 +1,7 @@
+{
+  "include": ["luoxu", "tests", "docker/embeddings"],
+  "extraPaths": ["."],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.12"
+}

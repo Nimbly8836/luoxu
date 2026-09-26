@@ -3,6 +3,7 @@ import contextlib
 import datetime
 import json
 import logging
+import uuid
 from typing import Any, Literal
 
 import asyncpg  # type: ignore[import-not-found]
@@ -13,7 +14,9 @@ from .ctxvars import group_title, msg_source
 from .indexing import format_msg, text_to_query
 from .mediamgr import MediaMgr
 from .ocr import OCRService
+from .semantic import EmbeddingClient, SemanticUnavailable, search_vectors
 from .types import GroupNotFound, SearchQuery
+from .storage import ArchiveConnection, conversation_archive
 from .util import UpdateLoaded, format_name
 
 logger = logging.getLogger(__name__)
@@ -52,11 +55,28 @@ class PostgreStore:
       )
     self.repair_non_forum_groups = frozenset(repair_non_forum_groups)
     self.pool = None
+    semantic_config = config.get("semantic", {})
+    self.embedder = (
+      EmbeddingClient(semantic_config.get("endpoint", "http://embeddings:8080/embed"))
+      if semantic_config.get("enabled", False) else None
+    )
 
   async def setup(self) -> None:
     self.pool = await asyncpg.create_pool(self.address)
+    try:
+      ready = await self.pool.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM bootstrap_state WHERE name='per-peer-storage-v1')"
+      )
+      if not ready:
+        raise RuntimeError("database storage migration 006_per_group_storage.sql is required")
+    except Exception:
+      await self.pool.close()
+      self.pool = None
+      raise
 
   async def close(self) -> None:
+    if self.embedder is not None:
+      await self.embedder.close()
     if self.pool:
       await self.pool.close()
 
@@ -190,12 +210,13 @@ class PostgreStore:
           row["id"],
         )
       return row
+    archive_id = await conn.fetchval("SELECT ensure_message_archive($1, $2)", peer_type, peer_id)
     inserted = await conn.fetchrow(
       """
       INSERT INTO conversations
         (kind, telegram_peer_type, telegram_peer_id, topic_id, name, pub_id,
-         legacy_group_id)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+         legacy_group_id, archive_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       ON CONFLICT DO NOTHING RETURNING *
       """,
       kind,
@@ -205,15 +226,26 @@ class PostgreStore:
       name,
       pub_id,
       legacy_group_id,
+      archive_id,
     )
     return inserted or await self._get_conversation(
       conn, kind, peer_type, peer_id, topic_id
     )
 
+  async def archive_conn(self, conn, conversation_id):
+    archive_id = await conversation_archive(conn, conversation_id)
+    if archive_id is None:
+      raise GroupNotFound(conversation_id)
+    return ArchiveConnection(conn, archive_id)
+
+  async def list_archives(self):
+    async with self.get_conn() as conn:
+      return await conn.fetch("SELECT id FROM message_archives ORDER BY id")
+
   async def get_group(self, conn, group_id: int):
     return await conn.fetchrow(
       """
-      SELECT g.*, c.id AS conversation_uuid, c.kind, c.topic_id
+      SELECT g.*, c.id AS conversation_uuid, c.kind, c.topic_id, c.archive_id
       FROM tg_groups g JOIN conversations c ON c.id = g.conversation_id
       WHERE g.group_id = $1
     """,
@@ -340,7 +372,8 @@ class PostgreStore:
     )
 
   async def _merge_topic_messages(self, conn, parent_id, topic_id, group_id):
-    # Move atomically, including yearly partitions. Replayed duplicates may
+    conn = await self.archive_conn(conn, parent_id)
+    # Move atomically within the peer's ordinary table. Replayed duplicates may
     # already exist in the parent; retain the latest state and never resurrect
     # a deletion. This repair does not create new historical snapshots.
     # Literal CTE; all variable IDs are separately bound as $1/$2/$3.
@@ -348,9 +381,9 @@ class PostgreStore:
     await conn.execute(
       """
       WITH moved AS (
-        DELETE FROM messages WHERE conversation_id = $2 RETURNING *
+        DELETE FROM {messages} WHERE conversation_id = $2 RETURNING *
       )
-      INSERT INTO messages (
+      INSERT INTO {messages} (
         conversation_id, group_id, msgid, reply_to_id, topic_id, quote_text,
         from_user, from_user_name, text, media, created_at, updated_at, deleted_at
       )
@@ -367,8 +400,8 @@ class PostgreStore:
         updated_at = EXCLUDED.updated_at, deleted_at = EXCLUDED.deleted_at
       WHERE (EXCLUDED.deleted_at IS NOT NULL,
              coalesce(EXCLUDED.deleted_at, EXCLUDED.updated_at, EXCLUDED.created_at))
-          > (messages.deleted_at IS NOT NULL,
-             coalesce(messages.deleted_at, messages.updated_at, messages.created_at))
+          > ({messages}.deleted_at IS NOT NULL,
+             coalesce({messages}.deleted_at, {messages}.updated_at, {messages}.created_at))
       """,
       parent_id,
       topic_id,
@@ -487,10 +520,11 @@ class PostgreStore:
     )
 
   async def _insert_one_message(self, conn, msg, text, conversation) -> None:
+    conn = ArchiveConnection(conn, conversation["archive_id"])
     sender = await msg.get_sender()
     old = await conn.fetchrow(
       """
-      SELECT * FROM messages
+      SELECT * FROM {messages}
       WHERE conversation_id = $1 AND msgid = $2
       ORDER BY created_at DESC LIMIT 1 FOR UPDATE
     """,
@@ -520,7 +554,7 @@ class PostgreStore:
     )
     await conn.execute(
       """
-      INSERT INTO messages
+      INSERT INTO {messages}
         (conversation_id, group_id, msgid, reply_to_id, topic_id, quote_text,
          from_user, from_user_name, text, media, created_at, updated_at, deleted_at)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL)
@@ -554,10 +588,10 @@ class PostgreStore:
     if not formatted:
       return
     async with self.get_conn() as conn:
-      # Lock peers in a stable order for multi-peer batches. Normal writers can
-      # run concurrently, but all yield to an exclusive relocation transaction.
+      # Serialize writes within each peer (including sender-counter updates).
+      # Stable lock order handles multi-peer batches without cross-peer cycles.
       for peer_id in sorted({self._peer_info(msg)[2] for msg, _ in formatted}):
-        await self._lock_peer_writes(conn, peer_id)
+        await self._lock_peer_writes(conn, peer_id, exclusive=True)
       data = [
         (msg, text, await self._conversation_for_message(conn, msg))
         for msg, text in formatted
@@ -588,12 +622,23 @@ class PostgreStore:
     peer_type=None,
   ) -> None:
     async with self.get_conn() as conn:
-      await self._lock_peer_writes(conn, peer_id)
+      await self._lock_peer_writes(conn, peer_id, exclusive=True)
       kinds = ("private_chat",) if kind == "private_chat" else ("group", "topic")
+      peers = await conn.fetch(
+        """SELECT DISTINCT archive_id FROM conversations
+           WHERE telegram_peer_id=$1 AND kind=ANY($2::text[])
+             AND ($3::text IS NULL OR telegram_peer_type=$3)""",
+        peer_id, kinds, peer_type,
+      )
+      # Never guess between a basic group, a channel and a private peer sharing
+      # a numeric ID. Telegram deletion callbacks normally provide peer_type.
+      if len(peers) != 1:
+        return
+      conn = ArchiveConnection(conn, peers[0]["archive_id"])
       for msgid in message_ids:
         old = await conn.fetchrow(
           """
-          SELECT m.* FROM messages m JOIN conversations c ON c.id = m.conversation_id
+          SELECT m.* FROM {messages} m JOIN conversations c ON c.id = m.conversation_id
           WHERE c.telegram_peer_id = $1 AND c.kind = ANY($2::text[])
             AND ($3::bigint IS NULL OR c.topic_id = $3)
             AND ($4::text IS NULL OR c.telegram_peer_type = $4)
@@ -611,7 +656,7 @@ class PostgreStore:
         await self._save_revision(conn, old, "delete")
         await conn.execute(
           """
-          UPDATE messages SET deleted_at = now(), text = ''
+          UPDATE {messages} SET deleted_at = now(), text = ''
           WHERE conversation_id = $1 AND msgid = $2
         """,
           old["conversation_id"],
@@ -676,9 +721,9 @@ class PostgreStore:
         await conn.fetchval(
           """
         SELECT EXISTS (
-          SELECT 1 FROM messages
+          SELECT 1 FROM archive_senders
           WHERE conversation_id = ANY($1::uuid[])
-            AND from_user = $2 AND deleted_at IS NULL
+            AND uid = $2 AND live_messages > 0
         )
         """,
           allowed or [],
@@ -686,98 +731,100 @@ class PostgreStore:
         )
       )
 
-  async def search(self, q: SearchQuery, principal: Principal):
-    async with self.get_conn() as conn:
-      allowed = await self._accessible_ids(conn, principal)
-      if q.group:
-        group = await self.get_group(conn, q.group)
-        if not group or group["conversation_uuid"] not in (allowed or []):
-          raise GroupNotFound(q.group)
-        groupinfo = {q.group: [group["pub_id"], group["name"]]}
-      else:
-        rows = await conn.fetch(
-          """
-          SELECT c.id, c.telegram_peer_id, c.pub_id, c.name
-          FROM conversations c
-          WHERE c.kind = 'group' AND c.id = ANY($1::uuid[])
-        """,
-          allowed or [],
-        )
-        groupinfo = {r["telegram_peer_id"]: [r["pub_id"], r["name"]] for r in rows}
-    ret = []
-    now = datetime.datetime.now(datetime.timezone.utc)
-    this_year = min(q.end, now).year if q.end else now.year
-    while True:
-      start = datetime.datetime(this_year, 1, 1, tzinfo=datetime.timezone.utc)
-      end = datetime.datetime(this_year + 1, 1, 1, tzinfo=datetime.timezone.utc)
-      date_start = max(q.start, start) if q.start else start
-      date_end = min(q.end, end) if q.end else end
-      if date_start > date_end:
-        break
-      ret += await self._search_one_year(
-        q, date_start, date_end, self.SEARCH_LIMIT - len(ret), principal
-      )
-      if len(ret) >= self.SEARCH_LIMIT or date_start < self.earliest_time:
-        break
-      this_year -= 1
-    return groupinfo, ret
+  async def _search_scope(self, conn, q, principal):
+    if not q.group and not q.conversation_id:
+      raise ValueError("g or conversation_id is required; cross-group search is disabled")
+    allowed = await self._accessible_ids(conn, principal)
+    group = await self.get_group(conn, q.group) if q.group else None
+    if q.group and not group:
+      raise GroupNotFound(q.group)
+    if q.conversation_id:
+      cid = uuid.UUID(str(q.conversation_id))
+    elif group is not None:
+      cid = group["conversation_uuid"]
+    else:
+      raise ValueError("g or conversation_id is required")
+    if cid not in (allowed or []):
+      raise GroupNotFound(cid)
+    target = await conn.fetchrow("SELECT * FROM conversations WHERE id=$1", cid)
+    if not target or (group and group["archive_id"] != target["archive_id"]):
+      raise GroupNotFound(cid)
+    # Even when the requested topic is visible, don't expose metadata from a
+    # different or unauthorized parent through groupinfo.
+    groups = await conn.fetch(
+      """SELECT g.* FROM tg_groups g JOIN conversations c ON c.id=g.conversation_id
+         WHERE c.archive_id=$1 AND c.id=ANY($2::uuid[])""",
+      target["archive_id"], allowed or [],
+    )
+    info = {r["group_id"]: [r["pub_id"], r["name"]] for r in groups}
+    return ArchiveConnection(conn, target["archive_id"]), allowed or [], info
 
-  async def _search_one_year(self, q, date_start, date_end, limit, principal):
+  async def search(self, q: SearchQuery, principal: Principal):
+    # Resolve and authorize before model calls or physical table routing.
     async with self.get_conn() as conn:
-      allowed = await self._accessible_ids(conn, principal)
-      query = text_to_query(q.terms.strip()) if q.terms else None
-      if q.terms and not query:
-        raise ValueError
-      rows = await conn.fetch(
+      scoped, allowed, groupinfo = await self._search_scope(conn, q, principal)
+      if q.mode == "keyword":
+        return groupinfo, await self._search_keywords(scoped, q, allowed)
+    if q.mode != "semantic":
+      raise ValueError("unknown search mode")
+    if self.embedder is None:
+      raise SemanticUnavailable("semantic search is not enabled")
+    if not q.terms or not q.terms.strip():
+      raise ValueError("semantic search requires q")
+    vector, = await self.embedder.embed([q.terms.strip()], query=True)
+    try:
+      async with self.get_conn() as conn:
+        # Recheck both permissions and routing after network/inference delay.
+        scoped, allowed, groupinfo = await self._search_scope(conn, q, principal)
+        rows = await search_vectors(scoped, q, allowed, vector, self.SEARCH_LIMIT + 1)
+    except (asyncpg.UndefinedTableError, asyncpg.UndefinedObjectError) as exc:
+      raise SemanticUnavailable("semantic search migration is required") from exc
+    return groupinfo, rows
+
+  async def _search_keywords(self, conn, q, allowed):
+    query = text_to_query(q.terms.strip()) if q.terms else None
+    if q.terms and not query:
+      raise ValueError
+    rows = await conn.fetch(
+      """
+      SELECT m.msgid, m.conversation_id, m.group_id, m.from_user,
+        m.from_user_name, m.created_at, m.updated_at, m.text, c.telegram_peer_id
+      FROM {messages} m JOIN conversations c ON c.id = m.conversation_id
+      WHERE m.deleted_at IS NULL AND m.conversation_id = ANY($1::uuid[])
+        AND ($2::timestamptz IS NULL OR m.created_at > $2)
+        AND ($3::timestamptz IS NULL OR m.created_at < $3)
+        AND ($4::bigint IS NULL OR m.group_id = $4)
+        AND ($5::uuid IS NULL OR m.conversation_id = $5)
+        AND ($6::text IS NULL OR m.text &@~ $6)
+        AND ($7::bigint[] IS NULL OR m.from_user = ANY($7))
+        AND ($9::bigint[] IS NULL OR m.from_user IS NULL
+             OR NOT (m.from_user = ANY($9)))
+      ORDER BY m.created_at DESC, m.msgid DESC LIMIT $8
+      """,
+      allowed, q.start, q.end, q.group or None, q.conversation_id,
+      query, q.sender, self.SEARCH_LIMIT, q.exclude_sender,
+    )
+    if query and rows:
+      by_id = {(r["conversation_id"], r["msgid"], r["created_at"]): r for r in rows}
+      highlighted = await conn.fetch(
         """
-        SELECT m.msgid, m.conversation_id, m.group_id, m.from_user,
-          m.from_user_name, m.created_at, m.updated_at, m.text, c.telegram_peer_id
-        FROM messages m JOIN conversations c ON c.id = m.conversation_id
-        WHERE m.deleted_at IS NULL AND m.conversation_id = ANY($1::uuid[])
-          AND m.created_at > $2 AND m.created_at < $3
-          AND ($4::bigint IS NULL OR m.group_id = $4)
-          AND ($5::uuid IS NULL OR m.conversation_id = $5)
-          AND ($6::text IS NULL OR m.text &@~ $6)
-          AND ($7::bigint[] IS NULL OR m.from_user = ANY($7))
-          AND ($9::bigint[] IS NULL OR m.from_user IS NULL
-               OR NOT (m.from_user = ANY($9)))
-        ORDER BY m.created_at DESC, m.msgid DESC LIMIT $8
+        SELECT m.conversation_id, m.msgid, m.created_at,
+          pgroonga_highlight_html(m.text, pgroonga_query_extract_keywords($1)) AS html
+        FROM {messages} m
+        JOIN unnest($3::uuid[], $4::bigint[], $5::timestamptz[]) AS selected(conversation_id, msgid, created_at)
+          ON selected.conversation_id = m.conversation_id
+         AND selected.msgid = m.msgid AND selected.created_at = m.created_at
+        WHERE m.conversation_id = ANY($2::uuid[])
         """,
-        allowed or [],
-        date_start,
-        date_end,
-        q.group or None,
-        q.conversation_id,
-        query,
-        q.sender,
-        max(0, limit),
-        q.exclude_sender,
+        query, allowed, [r["conversation_id"] for r in rows],
+        [r["msgid"] for r in rows], [r["created_at"] for r in rows],
       )
-      highlight_query = query
-      if highlight_query and rows:
-        # Highlight only the limited result set, avoiding a full-table highlight.
-        by_id = {(r["conversation_id"], r["msgid"]): r for r in rows}
-        highlighted = await conn.fetch(
-          """
-          SELECT m.conversation_id, m.msgid, pgroonga_highlight_html(m.text,
-            pgroonga_query_extract_keywords($1)) AS html
-          FROM messages m
-          JOIN unnest($3::uuid[], $4::bigint[]) AS selected(conversation_id, msgid)
-            ON selected.conversation_id = m.conversation_id
-           AND selected.msgid = m.msgid
-          WHERE m.conversation_id = ANY($2::uuid[])
-        """,
-          highlight_query,
-          allowed or [],
-          [row["conversation_id"] for row in rows],
-          [row["msgid"] for row in rows],
-        )
-        for row in highlighted:
-          key = (row["conversation_id"], row["msgid"])
-          if key in by_id:
-            by_id[key] = dict(by_id[key]) | {"html": row["html"]}
-        rows = [by_id[(r["conversation_id"], r["msgid"])] for r in rows]
-      return rows
+      for row in highlighted:
+        key = (row["conversation_id"], row["msgid"], row["created_at"])
+        if key in by_id:
+          by_id[key] = dict(by_id[key]) | {"html": row["html"]}
+      rows = [by_id[(r["conversation_id"], r["msgid"], r["created_at"])] for r in rows]
+    return rows
 
   async def get_groups(self, principal: Principal):
     async with self.get_conn() as conn:
@@ -791,25 +838,30 @@ class PostgreStore:
         allowed or [],
       )
 
-  async def find_names(self, group: int, q: str, principal: Principal):
+  async def find_names(self, group: int, q: str, principal: Principal, conversation_id=None):
     q = q.strip()
     if not q:
       raise ValueError
     async with self.get_conn() as conn:
-      allowed = self._accessible_ids(conn, principal)
+      conn, allowed, _ = await self._search_scope(
+        conn, SearchQuery(group, None, None, None, None, conversation_id), principal
+      )
       # Search names only in authorized, live messages.  The legacy usernames
       # table is intentionally not used here: it has no conversation UUID and
       # would leak names from private chats and from revoked conversations.
       sql = """
         SELECT from_user_name AS name, array_agg(DISTINCT from_user) AS uid,
                max(created_at) AS last_seen
-        FROM messages
+        FROM {messages}
         WHERE deleted_at IS NULL AND from_user IS NOT NULL
           AND conversation_id = ANY($1::uuid[])
           AND from_user_name ILIKE $2
       """
-      params = [await allowed, f"%{q}%"]
-      if group:
+      params = [allowed, f"%{q}%"]
+      if conversation_id:
+        sql += " AND conversation_id = $3"
+        params.append(uuid.UUID(str(conversation_id)))
+      elif group:
         sql += " AND group_id = $3"
         params.append(group)
       sql += " GROUP BY from_user_name ORDER BY last_seen DESC LIMIT 15"
@@ -824,9 +876,16 @@ class PostgreStore:
       allowed = await self._accessible_ids(conn, principal)
       if not allowed:
         return None
+      group = await self.get_group(conn, group_id)
+      if not group or not await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM conversations WHERE archive_id=$1 AND id=ANY($2::uuid[]))",
+        group["archive_id"], allowed,
+      ):
+        return None
+      conn = ArchiveConnection(conn, group["archive_id"])
       return await conn.fetchval(
         """
-        SELECT m.conversation_id FROM messages m
+        SELECT m.conversation_id FROM {messages} m
         JOIN conversations c ON c.id = m.conversation_id
         WHERE m.group_id = $1 AND m.msgid = $2
           AND c.kind IN ('group', 'topic') AND c.id = ANY($3::uuid[])
@@ -840,10 +899,13 @@ class PostgreStore:
   async def get_message(self, conversation_id, msgid, principal: Principal):
     async with self.get_conn() as conn:
       allowed = await self._accessible_ids(conn, principal)
+      if uuid.UUID(str(conversation_id)) not in (allowed or []):
+        return None
+      conn = await self.archive_conn(conn, conversation_id)
       return await conn.fetchrow(
         """
         SELECT m.*, c.kind, c.name, c.telegram_peer_id, c.topic_id AS conversation_topic_id
-        FROM messages m JOIN conversations c ON c.id = m.conversation_id
+        FROM {messages} m JOIN conversations c ON c.id = m.conversation_id
         WHERE m.conversation_id = $1 AND m.msgid = $2 AND m.conversation_id = ANY($3::uuid[])
         ORDER BY m.created_at DESC LIMIT 1
       """,
@@ -859,7 +921,7 @@ class PostgreStore:
     # plan. All message bodies are restricted to authorized conversations first.
     if children:
       sql = """
-        SELECT DISTINCT ON (msgid) * FROM messages
+        SELECT DISTINCT ON (msgid) * FROM {messages}
         WHERE conversation_id = ANY($1::uuid[]) AND reply_to_id = ANY($2::bigint[])
           AND NOT (msgid = ANY($3::bigint[]))
         ORDER BY msgid, (conversation_id = $4) DESC, created_at DESC, conversation_id
@@ -867,7 +929,7 @@ class PostgreStore:
       """
     else:
       sql = """
-        SELECT DISTINCT ON (msgid) * FROM messages
+        SELECT DISTINCT ON (msgid) * FROM {messages}
         WHERE conversation_id = ANY($1::uuid[]) AND msgid = ANY($2::bigint[])
           AND NOT (msgid = ANY($3::bigint[]))
         ORDER BY msgid, (conversation_id = $4) DESC, created_at DESC, conversation_id
@@ -966,10 +1028,13 @@ class PostgreStore:
   ):
     async with self.get_conn() as conn:
       allowed = await self._accessible_ids(conn, principal)
+      if uuid.UUID(str(conversation_id)) not in (allowed or []):
+        return None
+      conn = await self.archive_conn(conn, conversation_id)
       target = await conn.fetchrow(
         """
         SELECT m.*, c.kind, c.name, c.telegram_peer_id
-        FROM messages m JOIN conversations c ON c.id = m.conversation_id
+        FROM {messages} m JOIN conversations c ON c.id = m.conversation_id
         WHERE m.conversation_id = $1 AND m.msgid = $2
           AND m.conversation_id = ANY($3::uuid[])
         ORDER BY m.created_at DESC LIMIT 1
@@ -983,7 +1048,7 @@ class PostgreStore:
       topic = target["topic_id"]
       before_rows = await conn.fetch(
         """
-        SELECT * FROM messages WHERE conversation_id = $1
+        SELECT * FROM {messages} WHERE conversation_id = $1
           AND msgid <> $2 AND ($3::bigint IS NULL OR topic_id = $3)
           AND created_at < $4 ORDER BY created_at DESC LIMIT $5
       """,
@@ -995,7 +1060,7 @@ class PostgreStore:
       )
       after_rows = await conn.fetch(
         """
-        SELECT * FROM messages WHERE conversation_id = $1
+        SELECT * FROM {messages} WHERE conversation_id = $1
           AND msgid <> $2 AND ($3::bigint IS NULL OR topic_id = $3)
           AND created_at > $4 ORDER BY created_at ASC LIMIT $5
       """,

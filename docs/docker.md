@@ -38,7 +38,9 @@ Image replacement does **not** apply schema migrations. Existing database volume
 also do not rerun `dbsetup.sql`. Back up the database and stop all old indexers
 and Python Web processes before upgrading. Apply only migrations not already
 applied, in order: `001_access_control.sql`, `002_conversations.sql`,
-`003_message_history.sql`, then `004_group_monitoring.sql`.
+`003_message_history.sql`, `004_group_monitoring.sql`, then the mandatory
+`006_per_group_storage.sql`. Optional semantic migration `005` is applied
+**after 006**, not as a mandatory numerically ordered step.
 
 If `001`–`003` are already applied, the local Compose database can be upgraded
 with (retain your existing Compose `-f` flags):
@@ -47,6 +49,10 @@ with (retain your existing Compose `-f` flags):
 docker compose exec -T db sh -c \
   'exec psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
   < migrations/004_group_monitoring.sql
+
+docker compose exec -T db sh -c \
+  'exec psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  < migrations/006_per_group_storage.sql
 ```
 
 Use your normal authenticated PostgreSQL connection instead for an external DB.
@@ -56,6 +62,13 @@ or granting access. Old unwanted groups may resume; disable their manual
 reference through the admin API. Remaining account/public references still keep
 a group collecting. Repeating the migration does not resurrect disabled groups.
 See [group access and monitoring](group-access.md) for the full lifecycle.
+
+Migration 006 copies and verifies messages (and old global vectors if present)
+into independent ordinary per-peer tables, then removes the old yearly tables.
+It is transactional and refuses unknown dependent views rather than cascading.
+See [per-group storage and rollback requirements](group-storage.md). The new app
+refuses startup without the storage marker. Reverting only the image is not a
+rollback; restore the pre-migration backup to run old code again.
 
 After migration, start the new image using the existing configuration and data.
 `telegram.index_groups` is imported once; after that the database is authoritative.
@@ -149,6 +162,14 @@ Do not run `core` and `web` together with the same published port unless one
 of them is given a different port or the web-only service is removed; both
 publish port 9008 by default. The web-only mode is intended for a deployment
 where the indexer is elsewhere, or for an override with a separate port.
+
+## Optional semantic search
+
+CPU embeddings and a resumable indexing worker are available through
+`docker-compose.semantic.yml`. This opt-in override adds pgvector to the existing
+PostgreSQL 17/PGroonga image; the ordinary application image and keyword search
+remain unchanged. Existing volumes require optional migration `005` explicitly.
+See [semantic search deployment and API](semantic-search.md) before enabling it.
 
 ## OCR
 

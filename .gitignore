@@ -9,3 +9,4 @@ querytrans*.so
 __pycache__/
 target/
 build/
+.venv/

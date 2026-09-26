@@ -22,6 +22,7 @@ from telethon.tl.types import User  # type: ignore[import-not-found]
 from . import util
 from .auth import AuthService, Principal  # type: ignore[import-not-found]
 from .group import MonitoringUnavailable
+from .semantic import MAX_OFFSET, MAX_QUERY_CHARS, SemanticUnavailable
 from .types import GroupNotFound, SearchQuery
 
 logger = logging.getLogger(__name__)
@@ -206,10 +207,25 @@ class SearchHandler(BaseHandler):
       raise web.HTTPBadRequest from exc
     except GroupNotFound as exc:
       raise web.HTTPNotFound from exc
+    except SemanticUnavailable as exc:
+      return web.json_response(
+        {"error": str(exc)}, status=503, headers={"Cache-Control": "private, no-store"}
+      )
+    limit = self.dbconn.SEARCH_LIMIT
+    semantic = q.mode == "semantic"
+    has_more = len(messages) > limit if semantic else len(messages) == limit
+    metadata = {}
+    if semantic:
+      metadata = {
+        "mode": "semantic",
+        "next_offset": q.offset + limit if has_more and q.offset + limit <= MAX_OFFSET else None,
+      }
+      has_more = metadata["next_offset"] is not None
     return web.json_response(
       {
         "groupinfo": groupinfo,
-        "has_more": len(messages) == self.dbconn.SEARCH_LIMIT,
+        "has_more": has_more,
+        **metadata,
         "messages": [
           {
             "id": m["msgid"],
@@ -220,11 +236,12 @@ class SearchHandler(BaseHandler):
             "html": html_or_text(m),
             "t": m["created_at"].timestamp(),
             "edited": m["updated_at"].timestamp() if m["updated_at"] else None,
+            **({"score": m["score"]} if semantic else {}),
           }
-          for m in messages
+          for m in messages[:limit]
         ],
       },
-      headers={"Cache-Control": "max-age=0"},
+      headers={"Cache-Control": "private, no-store"},
     )
 
   def _parse_query(self, query):
@@ -232,6 +249,10 @@ class SearchHandler(BaseHandler):
     conversation_id = query.get("conversation_id") or None
     if conversation_id:
       _uuid(conversation_id)
+    if not group and not conversation_id:
+      raise web.HTTPBadRequest(text="g or conversation_id is required; cross-group search is disabled")
+    if group and not 0 < group < 2**63:
+      raise web.HTTPBadRequest(text="g must be a positive 64-bit integer")
     terms = query.get("q")
     sender = self._parse_sender(query.get("sender"))
     start = (
@@ -239,7 +260,19 @@ class SearchHandler(BaseHandler):
     )
     end = util.fromtimestamp(_int(query["end"], "end")) if query.get("end") else None
     exclude_sender = self._parse_sender(query.get("exclude_sender"))
-    return SearchQuery(group, terms, sender, start, end, conversation_id, exclude_sender)
+    mode = query.get("mode", "keyword")
+    if mode not in ("keyword", "semantic"):
+      raise web.HTTPBadRequest(text="mode must be keyword or semantic")
+    offset = _int(query.get("offset", 0), "offset")
+    if not 0 <= offset <= MAX_OFFSET or (mode == "keyword" and offset != 0):
+      raise web.HTTPBadRequest(text="offset is only supported for semantic search (0-1000)")
+    if mode == "semantic" and (not terms or not terms.strip() or len(terms) > MAX_QUERY_CHARS):
+      raise web.HTTPBadRequest(text="semantic q must contain 1-2000 characters")
+    if start and end and start >= end:
+      raise web.HTTPBadRequest(text="start must be before end")
+    return SearchQuery(
+      group, terms, sender, start, end, conversation_id, exclude_sender, mode, offset
+    )
 
   @staticmethod
   def _parse_sender(sender):
@@ -268,10 +301,22 @@ class GroupsHandler(BaseHandler):
 class NamesHandler(BaseHandler):
   async def _get(self, request):
     group = _int(request.query.get("g") or 0, "group")
+    if group and not 0 < group < 2 ** 63:
+      raise web.HTTPBadRequest(text="invalid group")
     query = request.query.get("q")
     if query is None:
       raise web.HTTPBadRequest(text="q is required")
-    names = await self.dbconn.find_names(group, query, request["principal"])
+    cid = request.query.get("conversation_id") or None
+    if cid:
+      _uuid(cid)
+    if not group and not cid:
+      raise web.HTTPBadRequest(text="g or conversation_id is required")
+    try:
+      names = await self.dbconn.find_names(group, query, request["principal"], cid)
+    except GroupNotFound as exc:
+      raise web.HTTPNotFound from exc
+    except ValueError as exc:
+      raise web.HTTPBadRequest from exc
     return web.json_response(
       {"names": names}, headers={"Cache-Control": "private, no-store"}
     )
@@ -1054,6 +1099,7 @@ async def run_web(config, port):
     while True:
       await asyncio.sleep(3600)
   finally:
+    await runner.cleanup()
     await db.close()
 
 

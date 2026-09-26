@@ -39,6 +39,9 @@ An indexed one-to-one Telegram conversation. It is not an accessible group and i
 **Conversation**:
 A searchable Telegram exchange represented in the archive. A conversation may be a group, a forum topic, or an explicitly indexed one-to-one private chat; each has its own access grants.
 
+**Physical archive**:
+One Telegram peer (group/channel or private chat) owns an independent ordinary message table and an optional matching vector table. A group's Topics share its physical table but retain separate conversation access boundaries. There is no global message parent table and no yearly partitioning. Content and sender-name searches must specify one group or conversation; unspecified scope is rejected, not widened to all accessible groups.
+
 **Forum topic**:
 A named discussion area in a Telegram group with Topics enabled. Ordinary message replies and their reply threads are not forum topics and remain part of the group conversation.
 

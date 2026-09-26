@@ -83,7 +83,34 @@ paths:
   /search:
     get:
       summary: Search current non-deleted message state
+      description: >-
+        g or conversation_id is required. Cross-group content search is not
+        supported; both parameters, if supplied, must select the same archive.
+        An inaccessible target returns 404. Each Telegram peer has independent
+        ordinary message and optional embedding tables, without year partitions.
+        Keyword mode is the default and orders by time. Optional semantic mode
+        ranks indexed messages by cosine similarity across all years, subject to
+        the same grants and filters. It does not interpret names/time from q,
+        generate answers, or apply keyword operators. Results may be incomplete
+        during background backfill. Similarity is not a probability of relevance.
       parameters:
+        - name: mode
+          in: query
+          schema:
+            type: string
+            enum: [keyword, semantic]
+            default: keyword
+        - name: offset
+          in: query
+          description: >-
+            Semantic-only pagination. Start at 0, then use next_offset from the
+            response (not the last message timestamp). Keep all filters unchanged.
+            Pages may shift as messages or permissions change.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000
+            default: 0
         - name: g
           in: query
           schema:
@@ -96,6 +123,7 @@ paths:
             format: uuid
         - name: q
           in: query
+          description: Semantic mode requires a nonblank natural-language query of at most 2000 characters.
           schema:
             type: string
         - name: sender
@@ -122,13 +150,27 @@ paths:
             type: integer
       responses:
         '200':
-          description: Search result
+          description: >-
+            groupinfo, has_more and up to 50 messages. Semantic mode additionally
+            returns mode=semantic, next_offset (integer or null), and a cosine
+            similarity score on each message. html is escaped original text,
+            not highlighted generated content. Keyword response is unchanged.
+        '400':
+          description: Missing target group/conversation, invalid mode, query, offset or filters
         '404':
           description: Conversation not accessible
+        '503':
+          description: Semantic search disabled, migration missing, or embedding service unavailable/busy
   /names:
     get:
-      summary: Search sender names in accessible groups
+      summary: Search sender names within one accessible group or conversation
+      description: g or conversation_id is required; no cross-group name search.
       parameters:
+        - name: conversation_id
+          in: query
+          schema:
+            type: string
+            format: uuid
         - name: g
           in: query
           schema:
@@ -142,6 +184,10 @@ paths:
       responses:
         '200':
           description: Matching names
+        '400':
+          description: Missing or invalid target/query
+        '404':
+          description: Target not found or not accessible
   /conversations/{conversation_id}/messages/{message_id}:
     get:
       summary: Get a message

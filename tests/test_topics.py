@@ -21,6 +21,7 @@ from telethon.tl.patched import Message
 from luoxu.auth import AuthService, Principal
 from luoxu.db import PostgreStore
 from luoxu.types import SearchQuery
+from luoxu.storage import archive_sql, conversation_archive
 from luoxu.util import UpdateLoaded
 from luoxu.web import setup_app
 
@@ -129,6 +130,8 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
       await conn.execute(schema_sql.read_text())
       self.parent = await self.db.insert_group(conn, channel())
     self.parent_id = self.parent["conversation_uuid"]
+    async with self.db.get_conn() as conn:
+      self.messages = archive_sql("{messages}", await conversation_archive(conn, self.parent_id))
 
   async def asyncTearDown(self):
     await self.db.close()
@@ -161,11 +164,12 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
     reply_to=None,
     group_id: int | None = GROUP_ID,
   ):
+    conn = await self.db.archive_conn(conn, cid)
     # Literal test SQL; all variable values use separately bound $1-$9.
     # pi-lens-ignore: python-sql-injection
     await conn.execute(
       """
-      INSERT INTO messages (
+      INSERT INTO {messages} (
         conversation_id, group_id, msgid, topic_id, text, from_user,
         from_user_name, created_at, updated_at, deleted_at, reply_to_id,
         quote_text, media
@@ -189,9 +193,9 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
     rows = await self.db.list_all_conversations()
     self.assertEqual([(r["kind"], r["id"]) for r in rows], [("group", self.parent_id)])
     async with self.db.get_conn() as conn:
-      self.assertEqual(await conn.fetchval("SELECT count(*) FROM messages"), 4)
+      self.assertEqual(await conn.fetchval(f"SELECT count(*) FROM {self.messages}"), 4)
       self.assertEqual(
-        await conn.fetchval("SELECT count(*) FROM messages WHERE topic_id IS NOT NULL"),
+        await conn.fetchval(f"SELECT count(*) FROM {self.messages} WHERE topic_id IS NOT NULL"),
         0,
       )
     await self.db.grant_public(self.parent_id)
@@ -233,8 +237,8 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
     async with self.db.get_conn() as conn:
       repaired = await self.db.insert_group(conn, channel())
       self.assertEqual(repaired["conversation_uuid"], self.parent_id)
-      self.assertEqual(await conn.fetchval("SELECT count(*) FROM messages"), 3)
-      rows = await conn.fetch("SELECT * FROM messages ORDER BY msgid")
+      self.assertEqual(await conn.fetchval(f"SELECT count(*) FROM {self.messages}"), 3)
+      rows = await conn.fetch(f"SELECT * FROM {self.messages} ORDER BY msgid")
       self.assertTrue(all(r["conversation_id"] == self.parent_id for r in rows))
       self.assertTrue(all(r["topic_id"] is None for r in rows))
       self.assertEqual(rows[1]["reply_to_id"], 1)
@@ -269,7 +273,7 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
     async with self.db.get_conn() as conn:
       await self.db.insert_group(conn, channel())
       self.assertEqual(await conn.fetchval("SELECT count(*) FROM message_revisions"), 1)
-      self.assertEqual(await conn.fetchval("SELECT count(*) FROM messages"), 3)
+      self.assertEqual(await conn.fetchval(f"SELECT count(*) FROM {self.messages}"), 3)
 
   async def test_repair_requires_operator_confirmation(self):
     self.db.repair_non_forum_groups = frozenset()
@@ -278,7 +282,7 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
       await self.seed_message(conn, topic_id, 1, topic_id=42)
       await self.db.insert_group(conn, channel())
       self.assertEqual(
-        await conn.fetchval("SELECT conversation_id FROM messages WHERE msgid = 1"),
+        await conn.fetchval(f"SELECT conversation_id FROM {self.messages} WHERE msgid = 1"),
         topic_id,
       )
       self.assertTrue(
@@ -324,7 +328,7 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
       )
       await self.seed_message(conn, first, 3, topic_id=42, text="", deleted=older)
       await self.db.insert_group(conn, channel())
-      rows = await conn.fetch("SELECT * FROM messages ORDER BY msgid")
+      rows = await conn.fetch(f"SELECT * FROM {self.messages} ORDER BY msgid")
       self.assertEqual(len(rows), 3)
       self.assertEqual(rows[0]["text"], "new")
       self.assertEqual(rows[0]["updated_at"], newer)
@@ -723,7 +727,7 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
       await self.wait_for_blocked_writer(conn.get_server_pid())
     # The deletion completes only after the relocating transaction commits.
     async with self.db.get_conn() as conn:
-      row = await conn.fetchrow("SELECT * FROM messages WHERE msgid = 1")
+      row = await conn.fetchrow(f"SELECT * FROM {self.messages} WHERE msgid = 1")
       self.assertEqual(row["conversation_id"], self.parent_id)
       self.assertIsNotNone(row["deleted_at"], "concurrent deletion must not be lost")
       self.assertEqual(row["text"], "")
@@ -748,7 +752,7 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
       tasks.create_task(self.db.insert_messages([message(1)], UpdateLoaded.update_none))
       await self.wait_for_blocked_writer(conn.get_server_pid())
     async with self.db.get_conn() as conn:
-      row = await conn.fetchrow("SELECT * FROM messages WHERE msgid = 1")
+      row = await conn.fetchrow(f"SELECT * FROM {self.messages} WHERE msgid = 1")
       self.assertEqual(row["conversation_id"], self.parent_id)
       self.assertEqual(
         row["deleted_at"], deleted, "history replay must not resurrect it"
@@ -764,7 +768,7 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
         await self.db.insert_group(conn, channel())
         raise RuntimeError("rollback probe")
     async with self.db.get_conn() as conn:
-      row = await conn.fetchrow("SELECT * FROM messages")
+      row = await conn.fetchrow(f"SELECT * FROM {self.messages}")
       self.assertEqual(row["conversation_id"], false_topic)
       self.assertIsNotNone(
         await conn.fetchrow(

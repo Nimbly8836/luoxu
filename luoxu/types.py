@@ -10,6 +10,8 @@ class SearchQuery(NamedTuple):
   end: datetime.datetime | None
   conversation_id: str | None = None
   exclude_sender: list[int] | None = None
+  mode: str = "keyword"
+  offset: int = 0
 
 
 class GroupNotFound(Exception):

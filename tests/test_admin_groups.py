@@ -146,10 +146,11 @@ class AdminGroupFixture(unittest.IsolatedAsyncioTestCase):
     self.assertFalse(conversation["is_public"])
     cid = conversation["id"]
     async with self.db.get_conn() as conn:
+      conn = await self.db.archive_conn(conn, cid)
       # Every value is bound through $1-$5; the SQL and identifiers are literal.
       # pi-lens-ignore: python-sql-injection
       await conn.execute(
-        """INSERT INTO messages
+        """INSERT INTO {messages}
           (conversation_id, group_id, msgid, text, from_user, from_user_name, created_at)
           VALUES ($1, $2, 1, 'visibility marker', $3, $4, $5)""",
         cid,
@@ -174,19 +175,11 @@ class AdminGroupFixture(unittest.IsolatedAsyncioTestCase):
     )
     search = {"q": "visibility", "start": "1735689600", "end": "1735862400"}
     response = await self.client.get(PREFIX + "/search", params=search, headers=headers)
-    self.assertEqual(response.status, 200, await response.text())
-    self.assertEqual(
-      {r["conversation_id"] for r in (await response.json())["messages"]},
-      allowed,
-    )
+    self.assertEqual(response.status, 400, await response.text())
     response = await self.client.get(
       PREFIX + "/names", params={"q": "sender"}, headers=headers
     )
-    self.assertEqual(response.status, 200)
-    self.assertEqual(
-      {r[0] for r in (await response.json())["names"]},
-      {group["sender_id"] for group in groups if group["cid"] in allowed},
-    )
+    self.assertEqual(response.status, 400)
     for group in groups:
       cid, gid, sender = group["cid"], group["group_id"], group["sender_id"]
       expected = 200 if cid in allowed else 404
@@ -213,13 +206,15 @@ class AdminGroupFixture(unittest.IsolatedAsyncioTestCase):
         params={**search, "conversation_id": cid},
         headers=headers,
       )
-      self.assertEqual(response.status, 200)
-      self.assertEqual(len((await response.json())["messages"]), int(cid in allowed))
+      self.assertEqual(response.status, expected)
+      if cid in allowed:
+        self.assertEqual(len((await response.json())["messages"]), 1)
       response = await self.client.get(
         PREFIX + "/names", params={"q": "sender", "g": gid}, headers=headers
       )
-      self.assertEqual(response.status, 200)
-      self.assertEqual(len((await response.json())["names"]), int(cid in allowed))
+      self.assertEqual(response.status, expected)
+      if cid in allowed:
+        self.assertEqual(len((await response.json())["names"]), 1)
 
 
 class AdminGroupTests(AdminGroupFixture):

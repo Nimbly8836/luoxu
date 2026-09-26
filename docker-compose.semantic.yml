@@ -1,0 +1,43 @@
+# Opt in with -f docker-compose.yml -f docker-compose.semantic.yml --profile semantic
+services:
+  db:
+    build:
+      context: ./docker/db-vector
+    image: luoxu-db:pg17-pgroonga-vector
+    volumes:
+      - ./migrations/005_semantic_search.sql:/docker-entrypoint-initdb.d/005-semantic.sql:ro
+
+  embeddings:
+    build:
+      context: .
+      dockerfile: docker/embeddings/Dockerfile
+    image: luoxu-embeddings:bge-small-zh-v1.5
+    profiles: [semantic]
+    expose:
+      - "8080"
+    volumes:
+      - luoxu-models:/models
+    environment:
+      EMBEDDING_THREADS: "4"
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
+  semantic-indexer:
+    image: ${LUOXU_IMAGE:-ghcr.io/nimbly8836/luoxu:latest}
+    profiles: [semantic]
+    depends_on:
+      db:
+        condition: service_healthy
+      embeddings:
+        condition: service_healthy
+    volumes:
+      - ./config.toml:/config/config.toml:ro
+    command: [python, -m, luoxu.semantic_indexer, --config, /config/config.toml]
+    restart: unless-stopped
+
+volumes:
+  luoxu-models:

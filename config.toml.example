@@ -35,6 +35,15 @@ url = "postgresql:///luoxu"
 # use a UNIX domain socket to connect
 # ocr_socket = "/path/to/socket/file"
 
+# Optional semantic search; see docs/semantic-search.md before enabling.
+# Requires per-group storage (006 for upgrades), pgvector, optional migration
+# 005 AFTER 006, the embedding service and background worker.
+[database.semantic]
+enabled = false
+endpoint = "http://embeddings:8080/embed"
+batch_size = 16
+poll_interval = 10
+
 [web]
 listen_host = "localhost"
 listen_port = 9008

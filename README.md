@@ -58,6 +58,8 @@ python -m luoxu
 
 当然了，你也可以自己另外编写 Web 页面来使用此 API。
 
+可选的[语义搜索模式](docs/semantic-search.md)使用本地 CPU 小型向量模型，适合用自然语言查找相关发言。请求 `/search?g=456&mode=semantic&q=工作压力&sender=123` 即可使用；不传 `mode` 仍为原有关键词搜索。需要单独启用向量服务、数据库迁移和后台索引。此仓库不包含前端源码，搜索模式切换按钮需由前端对接该参数。
+
 注意事项
 ====
 
@@ -69,6 +71,8 @@ luoxu 相当于运行一个 Telegram 客户端，其权限是完全的（包括�
 
 使用
 ====
+
+消息现按群/私聊保存到独立普通表，不再按年份分区。`/search` 和 `/names` 必须提供 `g` 或 `conversation_id`，不支持跨群查询；未指定目标返回 400。已有数据库必须执行 `006_per_group_storage.sql`，见[独立群表存储与迁移](docs/group-storage.md)。
 
 搜索消息时，搜索字符串不区分简繁（会使用 OpenCC 自动转换），也不进行分词（请手动将可能不连在一起的词语以空格分开）。
 
@@ -94,8 +98,10 @@ luoxu 相当于运行一个 Telegram 客户端，其权限是完全的（包括�
 6. 升级完成之后需要重新索引（如果索引已被连带删除，从 SQL 文件中找到创建索引的语句并执行）：
 
 ```sql
-reindex index usernames_idx;
-reindex index message_idx;
+-- 独立群表版本：在 psql 中为每个消息表重建索引。
+SELECT format('REINDEX TABLE %I;', 'messages_' || replace(id::text, '-', ''))
+FROM message_archives
+\gexec
 ```
 
 不兼容的变更
@@ -124,6 +130,8 @@ Web API 支持账号密码登录和 JWT Bearer Token。未认证请求使用匿�
 ====
 
 全新数据库执行 `dbsetup.sql`。已有数据库按顺序执行尚未应用的 `migrations/001_access_control.sql`、`migrations/002_conversations.sql`、`migrations/003_message_history.sql`、`migrations/004_group_monitoring.sql`。升级前备份数据库并停止旧索引器及 Python Web 服务。`004` 首次为所有旧 `tg_groups` 登记的群保留手动监听引用，不公开或授权；不再需要的旧群需在管理接口取消手动引用。迁移重复执行不会复活已停用群，也不会接管之后创建的仅归档群。镜像更新不自动执行迁移。
+
+当前独立群表版本还必须执行 `migrations/006_per_group_storage.sql`；启用语义搜索时再执行可选的 `005_semantic_search.sql`（顺序为 006 → 005）。迁移会验证复制结果后删除旧年度表，升级前必须备份并停止所有旧服务；不能仅回退镜像恢复旧结构。详见[独立群表迁移](docs/group-storage.md)。
 
 未启用 Topics 的群若出现大量同名 `topic`，请参阅[普通回复误分类修复说明](docs/topic-repair.md)。此次修复不需要新的 SQL 结构迁移；备份后，将确认未使用 Topics 的群 ID 加入 `telegram.repair_non_forum_groups`，更新并重启索引器后会在初始化这些群时自动归并旧数据。
 

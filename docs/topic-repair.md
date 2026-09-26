@@ -25,7 +25,7 @@ Telegram 当前的群属性无法证明群过去是否曾启用 Topics，因此�
 ## 升级步骤
 
 1. 备份 PostgreSQL 数据库，停止仍使用旧版代码的索引器，避免旧进程继续创建假话题。
-2. 按版本顺序执行尚未应用的迁移，再更新主程序/主镜像及独立 Python Web 服务。当前持久化监听版本需要 `004_group_monitoring.sql`；这是监听状态迁移，不是假话题清理脚本。
+2. 按版本顺序执行尚未应用的迁移，再更新主程序/主镜像及独立 Python Web 服务。当前版本需要 `004_group_monitoring.sql` 和[独立群表迁移 `006`](group-storage.md)；它们都不是假话题清理脚本。可选语义迁移 `005` 在 `006` 之后执行。
 3. 在现有 `[telegram]` 配置节中加入 `repair_non_forum_groups = [1998301990]`（整数 ID，不加引号）。通过 `GET /admin/groups` 确认目标群仍有监听引用，必要时对其规范群 UUID 调用 `PUT /admin/groups/{conversation_id}` 添加手动引用，然后重启 `core` 触发初始化。`telegram.index_groups` 仅首次导入，不能用旧配置覆盖后台停用状态；API 添加的持久化手动引用会在重启后恢复。单独重启 `web` 不执行修复。
 4. 检查索引器日志中的 `reply-thread conversations into non-forum group`，确认对应群已处理。大型群归并涉及消息和索引写入，请预留维护时间与磁盘空间。
 5. 通过 `/conversations` 或 `/admin/conversations` 确认原群仍存在、假话题消失，再验证搜索和上下文。必要时重新配置被移除的假话题专属授权。完成后可移除 `repair_non_forum_groups` 配置；新消息识别修复不依赖这个开关。

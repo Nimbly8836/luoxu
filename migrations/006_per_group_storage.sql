@@ -1,112 +1,34 @@
-CREATE EXTENSION IF NOT EXISTS pgroonga;
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
-CREATE TABLE message_archives (
+-- Mandatory storage migration. BACK UP and stop all old indexers, web servers
+-- and semantic workers first. Run with psql -v ON_ERROR_STOP=1.
+-- One transaction copies and verifies all rows before removing old tables.
+BEGIN;
+LOCK TABLE conversations IN ACCESS EXCLUSIVE MODE;
+CREATE TABLE IF NOT EXISTS message_archives (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   telegram_peer_type text NOT NULL CHECK (telegram_peer_type IN ('channel', 'chat', 'user')),
   telegram_peer_id bigint NOT NULL,
   table_version integer NOT NULL DEFAULT 1,
   UNIQUE (telegram_peer_type, telegram_peer_id)
 );
-
-CREATE TABLE conversations (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  archive_id uuid NOT NULL REFERENCES message_archives(id),
-  UNIQUE (id, archive_id),
-  kind text NOT NULL CHECK (kind IN ('group', 'topic', 'private_chat')),
-  telegram_peer_type text NOT NULL CHECK (telegram_peer_type IN ('channel', 'chat', 'user')),
-  telegram_peer_id bigint NOT NULL,
-  topic_id bigint,
-  name text NOT NULL,
-  pub_id text,
-  legacy_group_id bigint,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  CHECK ((kind = 'private_chat' AND telegram_peer_type = 'user' AND topic_id IS NULL)
-      OR (kind IN ('group', 'topic') AND telegram_peer_type IN ('channel', 'chat')))
-);
-CREATE UNIQUE INDEX conversations_telegram_idx
-  ON conversations (kind, telegram_peer_type, telegram_peer_id, coalesce(topic_id, 0));
-CREATE INDEX conversations_kind_idx ON conversations (kind);
-CREATE INDEX conversations_legacy_group_idx ON conversations (legacy_group_id)
-  WHERE legacy_group_id IS NOT NULL;
-
--- Compatibility table for the original /groups and /search?g= APIs.
-CREATE TABLE tg_groups (
-  group_id bigint PRIMARY KEY,
-  name text NOT NULL,
-  pub_id text,
-  loaded_first_id bigint,
-  loaded_last_id bigint,
-  conversation_id uuid NOT NULL UNIQUE REFERENCES conversations(id)
-);
-
-CREATE TABLE auth_users (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  username text NOT NULL UNIQUE CHECK (username ~ '^[A-Za-z0-9_.-]{1,64}$'),
-  password_hash text NOT NULL,
-  is_admin boolean NOT NULL DEFAULT false,
-  is_active boolean NOT NULL DEFAULT true,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE TABLE auth_refresh_tokens (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id uuid NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
-  token_hash text NOT NULL UNIQUE,
-  expires_at timestamptz NOT NULL,
-  revoked_at timestamptz,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX auth_refresh_active_idx ON auth_refresh_tokens (token_hash, expires_at)
-  WHERE revoked_at IS NULL;
-CREATE TABLE conversation_access (
-  user_id uuid NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
-  conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (user_id, conversation_id)
-);
-CREATE TABLE public_conversation_access (
-  conversation_id uuid PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE TABLE bootstrap_state (
-  name text PRIMARY KEY,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-
--- Manual indexing references, independent of public/user read permissions.
--- Keep disabled rows as tombstones so configuration import cannot resurrect them.
-CREATE TABLE group_monitoring (
-  conversation_id uuid PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
-  manual_enabled boolean NOT NULL DEFAULT true,
-  updated_at timestamptz NOT NULL DEFAULT now()
-);
--- Fresh installs have no legacy archives to adopt. Replaying upgrade 004 later
--- must not opt newer archive-only groups into monitoring.
-INSERT INTO bootstrap_state (name) VALUES ('group-monitoring-legacy-v1');
-
-CREATE TABLE message_revisions (
-  id bigserial PRIMARY KEY,
-  conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-  msgid bigint NOT NULL,
-  revision_type text NOT NULL CHECK (revision_type IN ('edit', 'delete')),
-  text text NOT NULL,
-  from_user bigint,
-  from_user_name text NOT NULL,
-  reply_to_id bigint,
-  topic_id bigint,
-  quote_text text,
-  media jsonb,
-  created_at timestamptz NOT NULL,
-  updated_at timestamptz,
-  deleted_at timestamptz,
-  captured_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX message_revisions_lookup_idx
-  ON message_revisions (conversation_id, msgid, captured_at DESC);
-
--- Existing installations: apply outstanding 001-004, then 006_per_group_storage.
--- Optional semantic search: apply 005 after 006 (also on fresh databases).
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS archive_id uuid;
+INSERT INTO message_archives (telegram_peer_type, telegram_peer_id)
+  SELECT DISTINCT telegram_peer_type, telegram_peer_id FROM conversations
+  ON CONFLICT (telegram_peer_type, telegram_peer_id) DO NOTHING;
+UPDATE conversations c SET archive_id = a.id FROM message_archives a
+  WHERE a.telegram_peer_type = c.telegram_peer_type AND a.telegram_peer_id = c.telegram_peer_id
+    AND c.archive_id IS NULL;
+ALTER TABLE conversations ALTER COLUMN archive_id SET NOT NULL;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='conversations'::regclass
+                 AND conname='conversations_archive_id_fkey') THEN
+    ALTER TABLE conversations ADD CONSTRAINT conversations_archive_id_fkey
+      FOREIGN KEY (archive_id) REFERENCES message_archives(id);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='conversations'::regclass
+                 AND conname='conversations_id_archive_id_key') THEN
+    ALTER TABLE conversations ADD CONSTRAINT conversations_id_archive_id_key UNIQUE (id, archive_id);
+  END IF;
+END $$;
 
 -- Independent ordinary tables, shared DDL template (never used for data).
 CREATE TABLE IF NOT EXISTS message_template (
@@ -222,4 +144,66 @@ BEGIN
 END;
 $$;
 
-INSERT INTO bootstrap_state (name) VALUES ('per-peer-storage-v1');
+
+DO $migration$
+DECLARE
+  a record;
+  mt text;
+  et text;
+  cols text := 'conversation_id, group_id, msgid, reply_to_id, topic_id, quote_text, from_user, from_user_name, text, media, created_at, updated_at, deleted_at';
+  ecols text := 'conversation_id, msgid, created_at, model, content_hash, embedding';
+  mismatch boolean;
+  has_vectors boolean;
+BEGIN
+  IF EXISTS (SELECT 1 FROM bootstrap_state WHERE name='per-peer-storage-v1') THEN
+    RETURN;
+  END IF;
+  IF to_regclass('messages') IS NULL THEN
+    RAISE EXCEPTION 'legacy messages table missing; refusing an unverifiable migration';
+  END IF;
+  LOCK TABLE messages IN ACCESS EXCLUSIVE MODE;
+  has_vectors := to_regclass('message_embeddings') IS NOT NULL;
+  IF has_vectors THEN
+    LOCK TABLE message_embeddings IN ACCESS EXCLUSIVE MODE;
+    -- LIKE does not copy foreign keys. pgvector is already installed here.
+    EXECUTE 'CREATE TABLE IF NOT EXISTS message_embedding_template (LIKE message_embeddings INCLUDING ALL)';
+  END IF;
+  FOR a IN SELECT * FROM message_archives ORDER BY id LOOP
+    PERFORM provision_message_archive(a.id);
+    mt := 'messages_' || replace(a.id::text, '-', '');
+    et := 'embeddings_' || replace(a.id::text, '-', '');
+    EXECUTE format('INSERT INTO %I (%s) SELECT %s FROM messages
+      WHERE conversation_id IN (SELECT id FROM conversations WHERE archive_id=$1)
+      ON CONFLICT DO NOTHING', mt, cols, cols) USING a.id;
+    -- Compare complete rows in BOTH directions (including text, edits, deletes).
+    EXECUTE format('SELECT EXISTS (
+      (SELECT %s FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE archive_id=$1)
+       EXCEPT SELECT %s FROM %I)
+      UNION ALL
+      (SELECT %s FROM %I EXCEPT SELECT %s FROM messages
+       WHERE conversation_id IN (SELECT id FROM conversations WHERE archive_id=$1)))',
+      cols, cols, mt, cols, mt, cols) INTO mismatch USING a.id;
+    IF mismatch THEN RAISE EXCEPTION 'message verification failed for %', a.id; END IF;
+    IF has_vectors THEN
+      EXECUTE format('INSERT INTO %I (%s) SELECT %s FROM message_embeddings
+        WHERE conversation_id IN (SELECT id FROM conversations WHERE archive_id=$1)
+        ON CONFLICT DO NOTHING', et, ecols, ecols) USING a.id;
+      EXECUTE format('SELECT EXISTS (
+        (SELECT %s FROM message_embeddings WHERE conversation_id IN (SELECT id FROM conversations WHERE archive_id=$1)
+         EXCEPT SELECT %s FROM %I)
+        UNION ALL
+        (SELECT %s FROM %I EXCEPT SELECT %s FROM message_embeddings
+         WHERE conversation_id IN (SELECT id FROM conversations WHERE archive_id=$1)))',
+        ecols, ecols, et, ecols, et, ecols) INTO mismatch USING a.id;
+      IF mismatch THEN RAISE EXCEPTION 'embedding verification failed for %', a.id; END IF;
+    END IF;
+  END LOOP;
+  -- No CASCADE: unknown external dependencies must abort rather than be deleted.
+  IF has_vectors THEN DROP TABLE message_embeddings; END IF;
+  DROP TABLE messages;
+  INSERT INTO bootstrap_state (name) VALUES ('per-peer-storage-v1');
+END;
+$migration$;
+DROP FUNCTION IF EXISTS init_message_partitions();
+DROP FUNCTION IF EXISTS create_messages_partition(integer);
+COMMIT;
