@@ -13,6 +13,7 @@ class SearchQuery(NamedTuple):
   mode: str = "keyword"
   offset: int = 0
   include_deleted: bool = False
+  min_score: float | None = None
 
 
 class GroupNotFound(Exception):

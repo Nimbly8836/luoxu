@@ -23,6 +23,7 @@ from . import util
 from .auth import AuthService, Principal  # type: ignore[import-not-found]
 from .group import MonitoringUnavailable
 from .semantic import MAX_OFFSET, MAX_QUERY_CHARS, SemanticUnavailable
+from .rerank import valid_score
 from .types import GroupNotFound, SearchQuery
 
 logger = logging.getLogger(__name__)
@@ -215,13 +216,18 @@ class SearchHandler(BaseHandler):
       return web.json_response(
         {"error": str(exc)}, status=503, headers={"Cache-Control": "private, no-store"}
       )
-    limit = self.dbconn.SEARCH_LIMIT
     semantic = q.mode == "semantic"
+    reranker = self.dbconn.reranker if semantic else None
+    limit = reranker.page_size if reranker else self.dbconn.SEARCH_LIMIT
     has_more = len(messages) > limit if semantic else len(messages) == limit
     metadata = {}
     if semantic:
       metadata = {
         "mode": "semantic",
+        "ranking": "reranker" if reranker else "vector",
+        "min_score": (reranker.min_score if q.min_score is None else q.min_score) if reranker else None,
+        "page_size": limit,
+        "candidates": reranker.candidates if reranker else None,
         "next_offset": q.offset + limit if has_more and q.offset + limit <= MAX_OFFSET else None,
       }
       has_more = metadata["next_offset"] is not None
@@ -241,6 +247,7 @@ class SearchHandler(BaseHandler):
             "t": m["created_at"].timestamp(),
             "edited": m["updated_at"].timestamp() if m["updated_at"] else None,
             **({"score": m["score"]} if semantic else {}),
+            **({"vector_score": m["vector_score"]} if reranker else {}),
             "deleted": m["deleted_at"] is not None,
             "deleted_at": m["deleted_at"].timestamp() if m["deleted_at"] else None,
             "content_source": m["content_source"],
@@ -287,6 +294,14 @@ class SearchHandler(BaseHandler):
       raise web.HTTPBadRequest(text="include_deleted must be true or false")
     if mode == "semantic" and include_deleted == "true":
       raise web.HTTPBadRequest(text="include_deleted is not supported for semantic search")
+    min_score = None
+    if "min_score" in query:
+      try:
+        min_score = float(query["min_score"])
+      except (TypeError, ValueError) as exc:
+        raise web.HTTPBadRequest(text="invalid min_score") from exc
+      if mode != "semantic" or not valid_score(min_score):
+        raise web.HTTPBadRequest(text="min_score requires semantic mode and a number in 0-1")
     return SearchQuery(
       group, terms, sender, start, end,
       conversation_id=conversation_id,
@@ -294,6 +309,7 @@ class SearchHandler(BaseHandler):
       mode=mode,
       offset=offset,
       include_deleted=include_deleted == "true",
+      min_score=min_score,
     )
 
   @staticmethod

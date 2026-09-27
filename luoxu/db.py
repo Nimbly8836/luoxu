@@ -14,7 +14,8 @@ from .ctxvars import group_title, msg_source
 from .indexing import format_msg, text_to_query
 from .mediamgr import MediaMgr
 from .ocr import OCRService
-from .semantic import EmbeddingClient, SemanticUnavailable, search_vectors
+from .semantic import EmbeddingClient, MAX_QUERY_CHARS, SemanticUnavailable, search_vectors
+from .rerank import RerankerClient, valid_score
 from .types import GroupNotFound, SearchQuery
 from .storage import ArchiveConnection, conversation_archive
 from .util import UpdateLoaded, format_name
@@ -56,6 +57,10 @@ class PostgreStore:
     self.repair_non_forum_groups = frozenset(repair_non_forum_groups)
     self.pool = None
     semantic_config = config.get("semantic", {})
+    if not isinstance(semantic_config, dict) or type(semantic_config.get("enabled", False)) is not bool:
+      raise ValueError("database.semantic.enabled must be boolean")
+    reranker = RerankerClient(semantic_config.get("rerank", {}))
+    self.reranker = reranker if reranker.enabled else None
     self.embedder = (
       EmbeddingClient(semantic_config.get("endpoint", "http://embeddings:8080/embed"))
       if semantic_config.get("enabled", False) else None
@@ -75,6 +80,8 @@ class PostgreStore:
       raise
 
   async def close(self) -> None:
+    if self.reranker is not None:
+      await self.reranker.close()
     if self.embedder is not None:
       await self.embedder.close()
     if self.pool:
@@ -910,6 +917,10 @@ class PostgreStore:
     return ArchiveConnection(conn, target["archive_id"]), allowed or [], info
 
   async def search(self, q: SearchQuery, principal: Principal):
+    if q.min_score is not None and (
+      q.mode != "semantic" or self.reranker is None or not valid_score(q.min_score)
+    ):
+      raise ValueError("min_score requires reranking and must be a finite number in 0-1")
     if q.include_deleted and q.mode == "semantic":
       raise ValueError("include_deleted is not supported for semantic search")
     if q.include_deleted and not self.history_enabled:
@@ -926,14 +937,39 @@ class PostgreStore:
       raise ValueError("unknown search mode")
     if self.embedder is None:
       raise SemanticUnavailable("semantic search is not enabled")
-    if not q.terms or not q.terms.strip():
-      raise ValueError("semantic search requires q")
+    if not q.terms or not q.terms.strip() or len(q.terms) > MAX_QUERY_CHARS:
+      raise ValueError("semantic search requires q of 1-2000 characters")
     vector, = await self.embedder.embed([q.terms.strip()], query=True)
     try:
       async with self.get_conn() as conn:
         # Recheck both permissions and routing after network/inference delay.
         scoped, allowed, groupinfo = await self._search_scope(conn, q, principal)
-        rows = await search_vectors(scoped, q, allowed, vector, self.SEARCH_LIMIT + 1)
+        window_query = q._replace(offset=0) if self.reranker else q
+        limit = self.reranker.candidates if self.reranker else self.SEARCH_LIMIT + 1
+        rows = await search_vectors(scoped, window_query, allowed, vector, limit)
+      if self.reranker is not None:
+        # The transaction has closed before HTTP/CPU inference, including waits.
+        scores = await self.reranker.rerank(q.terms, [r["text"] for r in rows])
+        def key(row):
+          return row["conversation_id"], row["msgid"], row["created_at"]
+        scored = {
+          key(r): (r["text"], score, r["score"], index)
+          for index, (r, score) in enumerate(zip(rows, scores, strict=True))
+        }
+        # Always recheck, even when every score is below the threshold. Fresh
+        # metadata and unchanged text only; never backfill unscored candidates.
+        async with self.get_conn() as conn:
+          scoped, allowed, groupinfo = await self._search_scope(conn, q, principal)
+          fresh = await search_vectors(scoped, window_query, allowed, vector, limit)
+        cutoff = self.reranker.min_score if q.min_score is None else q.min_score
+        rows = []
+        for row in fresh:
+          previous = scored.get(key(row))
+          if previous is not None and previous[0] == row["text"] and previous[1] >= cutoff:
+            rows.append({**dict(row), "vector_score": previous[2], "score": previous[1]})
+        # Ties retain the original deterministic cosine/date/physical-key order.
+        rows.sort(key=lambda r: (-r["score"], scored[key(r)][3]))
+        rows = rows[q.offset:q.offset + self.reranker.page_size + 1]
     except (asyncpg.UndefinedTableError, asyncpg.UndefinedObjectError) as exc:
       raise SemanticUnavailable("semantic search migration is required") from exc
     return groupinfo, rows

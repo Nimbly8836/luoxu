@@ -26,6 +26,26 @@ services:
       retries: 60
       start_period: 60s
 
+  reranker:
+    build:
+      context: .
+      dockerfile: docker/reranker/Dockerfile
+    image: luoxu-reranker:bge-reranker-base
+    profiles: [rerank]
+    expose:
+      - "8080"
+    volumes:
+      - luoxu-models:/models
+    environment:
+      RERANKER_THREADS: "4"
+      RERANKER_BATCH_SIZE: "8"
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
   semantic-indexer:
     image: ${LUOXU_IMAGE:-ghcr.io/nimbly8836/luoxu:latest}
     profiles: [semantic]

@@ -178,7 +178,7 @@ class FakeEmbedder(EmbeddingClient):
 
 
 @unittest.skipUnless(DATABASE_URL, "requires disposable LUOXU_TEST_DATABASE_URL with pgvector")
-class SemanticDatabaseTests(unittest.IsolatedAsyncioTestCase):
+class SemanticDatabaseFixture(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self):
     self.admin = await asyncpg.connect(DATABASE_URL)
     # Extensions live in public, not the per-test schema that teardown removes.
@@ -247,6 +247,8 @@ class SemanticDatabaseTests(unittest.IsolatedAsyncioTestCase):
   def client(self):
     return TestClient(TestServer(setup_app(self.db, None, "/tmp", "nobody.jpg", "ghost.jpg")))
 
+
+class SemanticDatabaseTests(SemanticDatabaseFixture):
   async def test_whitespace_cannot_poison_http_backfill(self):
     await self.seed(1, "\n\t")
     await self.seed(2, STRIP_CHARS)

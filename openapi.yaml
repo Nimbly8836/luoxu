@@ -92,7 +92,12 @@ paths:
         ranks indexed messages by cosine similarity across all years, subject to
         the same grants and filters. It does not interpret names/time from q,
         generate answers, or apply keyword operators. Results may be incomplete
-        during background backfill. Similarity is not a probability of relevance.
+        during background backfill. Optional CPU reranking scores a fixed,
+        authorized vector candidate window (default 50, maximum 200), applies
+        a relevance cutoff, then paginates (default 20, maximum 50). It cannot
+        recover matches outside that window and never fills below the cutoff.
+        Scores are sigmoid(logit) relevance, NOT calibrated correctness probabilities.
+        Without reranking, score remains cosine similarity with no cutoff.
         Default search excludes deleted messages. Explicit include_deleted=true
         additionally searches the latest saved deletion snapshot for each exact
         archived message variant, with current access checks and enabled
@@ -109,6 +114,16 @@ paths:
             type: string
             enum: [keyword, semantic]
             default: keyword
+        - name: min_score
+          in: query
+          description: >-
+            Optional relevance cutoff override, inclusive. Requires semantic mode
+            and enabled reranking; otherwise 400. Omit to use configured cutoff
+            (initial default 0.5). Not a calibrated correctness probability.
+          schema:
+            type: number
+            minimum: 0
+            maximum: 1
         - name: offset
           in: query
           description: >-
@@ -171,8 +186,9 @@ paths:
         '200':
           description: >-
             groupinfo, has_more and up to 50 messages. Semantic mode additionally
-            returns mode=semantic, next_offset (integer or null), and a cosine
-            similarity score on each message. html is escaped original text,
+            returns mode=semantic, ranking, min_score, page_size, candidates,
+            next_offset (integer or null), and active ranking score per message.
+            Reranked messages also carry original vector_score. html is escaped original text,
             not highlighted generated content. Both modes include deletion provenance.
           content:
             application/json:
@@ -185,7 +201,7 @@ paths:
         '404':
           description: Conversation not accessible
         '503':
-          description: Semantic search disabled, migration missing, or embedding service unavailable/busy
+          description: Semantic search disabled, migration missing, or embedding/reranking service unavailable, busy, timed out or malformed; never silently falls back
   /names:
     get:
       summary: Search sender names within one accessible group or conversation
@@ -693,6 +709,25 @@ components:
           type: string
           enum: [semantic]
           description: Present only for semantic mode
+        ranking:
+          type: string
+          enum: [vector, reranker]
+          description: Present only for semantic mode; determines score meaning
+        min_score:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+          description: Effective inclusive reranking cutoff; null in vector-only mode
+        page_size:
+          type: integer
+          minimum: 1
+          maximum: 50
+          description: Semantic page bound; default 20 with reranking, otherwise 50
+        candidates:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 200
+          description: Fixed vector window bound with reranking; otherwise null
         next_offset:
           type: [integer, 'null']
           minimum: 0
@@ -735,7 +770,13 @@ components:
             and keyword ordering, not semantic ranking
         score:
           type: number
-          description: Semantic-only cosine similarity, not a probability
+          description: >-
+            Semantic-only active ranking score. Cosine similarity for ranking=vector;
+            sigmoid(logit) relevance in 0-1 for ranking=reranker, NOT calibrated
+            correctness probability.
+        vector_score:
+          type: number
+          description: Original cosine similarity, present only with reranking
         edited: {type: [number, 'null']}
         deleted: {type: boolean}
         deleted_at: {type: [number, 'null']}
