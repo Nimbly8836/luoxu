@@ -87,17 +87,26 @@ class EmbeddingClient:
 
 
 async def search_vectors(conn, q, allowed, vector, limit):
-  # Exact cosine ranking is deliberate at ~100k messages: all ACL/metadata
-  # predicates apply before LIMIT, with no ANN post-filter recall loss.
+  # Exact ranking keeps every ACL/metadata predicate before LIMIT. The bounded
+  # subquery prevents flattening: compute distance once, then project the score
+  # only for the selected window. Sort by raw distance, not rounded 1-distance.
+  # Materialize only the ONE query vector: generic prepared plans otherwise
+  # repeat the expensive text-to-vector cast for every eligible message.
   # The content hash also excludes stale vectors during an edit/backfill race.
   return await conn.fetch(
     """
+    WITH query_vector AS MATERIALIZED (
+      SELECT $1::text::vector AS embedding
+    )
+    SELECT ranked.msgid, ranked.conversation_id, ranked.group_id, ranked.from_user,
+      ranked.from_user_name, ranked.created_at, ranked.updated_at, ranked.text,
+      ranked.deleted_at, 'current'::text AS content_source,
+      NULL::timestamptz AS snapshot_captured_at, 1 - ranked.distance AS score
+    FROM (
     SELECT m.msgid, m.conversation_id, m.group_id, m.from_user,
-      m.from_user_name, m.created_at, m.updated_at, m.text,
-      m.deleted_at, 'current'::text AS content_source,
-      NULL::timestamptz AS snapshot_captured_at,
-      1 - (e.embedding <=> $1::text::vector) AS score
-    FROM {messages} m JOIN {embeddings} e
+      m.from_user_name, m.created_at, m.updated_at, m.text, m.deleted_at,
+      e.embedding <=> query_vector.embedding AS distance
+    FROM query_vector CROSS JOIN {messages} m JOIN {embeddings} e
       ON e.conversation_id = m.conversation_id AND e.msgid = m.msgid
         AND e.created_at = m.created_at AND e.content_hash = md5(m.text)
     WHERE e.model = $2 AND m.deleted_at IS NULL
@@ -109,9 +118,11 @@ async def search_vectors(conn, q, allowed, vector, limit):
            OR NOT (m.from_user = ANY($7)))
       AND ($8::timestamptz IS NULL OR m.created_at > $8)
       AND ($9::timestamptz IS NULL OR m.created_at < $9)
-    ORDER BY e.embedding <=> $1::text::vector, m.created_at DESC,
-      m.conversation_id, m.msgid DESC
+    ORDER BY distance, m.created_at DESC, m.conversation_id, m.msgid DESC
     LIMIT $10 OFFSET $11
+    ) ranked
+    ORDER BY ranked.distance, ranked.created_at DESC,
+      ranked.conversation_id, ranked.msgid DESC
     """,
     vector,
     MODEL_ID,
@@ -124,6 +135,56 @@ async def search_vectors(conn, q, allowed, vector, limit):
     q.end,
     limit,
     q.offset,
+  )
+
+
+async def revalidate_candidates(conn, q, allowed, candidates):
+  """Fresh metadata for the initial physical keys; no vector reads or ranking.
+
+  Caller must freshly authorize/route even when candidates is empty. LATERAL's
+  OFFSET 0 keeps the lookup parameterized by each exact key rather than letting
+  the planner hash/scan the entire archive for this at-most-200-row window.
+  """
+  if not candidates:
+    return []
+  return await conn.fetch(
+    """
+    SELECT current.*
+    FROM unnest($1::uuid[], $2::bigint[], $3::timestamptz[])
+      AS candidate(conversation_id, msgid, created_at)
+    CROSS JOIN LATERAL (
+      SELECT m.msgid, m.conversation_id, m.group_id, m.from_user,
+        m.from_user_name, m.created_at, m.updated_at, m.text,
+        m.deleted_at, 'current'::text AS content_source,
+        NULL::timestamptz AS snapshot_captured_at
+      FROM {messages} m JOIN {embeddings} e
+        ON e.conversation_id = m.conversation_id AND e.msgid = m.msgid
+          AND e.created_at = m.created_at AND e.content_hash = md5(m.text)
+      WHERE m.conversation_id = candidate.conversation_id
+        AND m.msgid = candidate.msgid AND m.created_at = candidate.created_at
+        AND e.model = $4 AND m.deleted_at IS NULL
+        AND m.conversation_id = ANY($5::uuid[])
+        AND ($6::bigint IS NULL OR m.group_id = $6)
+        AND ($7::uuid IS NULL OR m.conversation_id = $7)
+        AND ($8::bigint[] IS NULL OR m.from_user = ANY($8))
+        AND ($9::bigint[] IS NULL OR m.from_user IS NULL
+             OR NOT (m.from_user = ANY($9)))
+        AND ($10::timestamptz IS NULL OR m.created_at > $10)
+        AND ($11::timestamptz IS NULL OR m.created_at < $11)
+      OFFSET 0
+    ) current
+    """,
+    [row["conversation_id"] for row in candidates],
+    [row["msgid"] for row in candidates],
+    [row["created_at"] for row in candidates],
+    MODEL_ID,
+    allowed or [],
+    q.group or None,
+    q.conversation_id,
+    q.sender,
+    q.exclude_sender,
+    q.start,
+    q.end,
   )
 
 

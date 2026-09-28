@@ -14,7 +14,10 @@ from .ctxvars import group_title, msg_source
 from .indexing import format_msg, text_to_query
 from .mediamgr import MediaMgr
 from .ocr import OCRService
-from .semantic import EmbeddingClient, MAX_QUERY_CHARS, SemanticUnavailable, search_vectors
+from .semantic import (
+  EmbeddingClient, MAX_QUERY_CHARS, SemanticUnavailable,
+  revalidate_candidates, search_vectors,
+)
 from .rerank import RerankerClient, valid_score
 from .types import GroupNotFound, SearchQuery
 from .storage import ArchiveConnection, conversation_archive
@@ -958,9 +961,11 @@ class PostgreStore:
         }
         # Always recheck, even when every score is below the threshold. Fresh
         # metadata and unchanged text only; never backfill unscored candidates.
+        # This request's initial window is authoritative: newly better-ranked
+        # vectors cannot evict its still-valid candidates during inference.
         async with self.get_conn() as conn:
           scoped, allowed, groupinfo = await self._search_scope(conn, q, principal)
-          fresh = await search_vectors(scoped, window_query, allowed, vector, limit)
+          fresh = await revalidate_candidates(scoped, q, allowed, rows)
         cutoff = self.reranker.min_score if q.min_score is None else q.min_score
         rows = []
         for row in fresh:

@@ -16,7 +16,10 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from luoxu.db import PostgreStore
 from luoxu.rerank import MODEL_ID, RerankerClient
-from luoxu.semantic import MAX_DOCUMENT_CHARS, MAX_QUERY_CHARS, SemanticUnavailable
+from luoxu.semantic import (
+  MAX_DOCUMENT_CHARS, MAX_QUERY_CHARS, SemanticUnavailable,
+  search_vectors, revalidate_candidates, vector_literal,
+)
 from luoxu.types import GroupNotFound, SearchQuery
 from test_semantic_search import DATABASE_URL, ROOT, UTC
 
@@ -349,6 +352,104 @@ class RerankingDatabaseTests(semantic_tests.SemanticDatabaseFixture):
     self.before_return = revoke
     with self.assertRaises(GroupNotFound):
       await self.search()
+
+  async def test_exactly_one_ranking_and_bounded_revalidation(self):
+    for mid in range(1, 7):
+      await self.seed(mid, f"job {mid}")
+    await self.backfill()
+    assert self.db.reranker is not None
+    self.db.reranker.candidates = 3
+    with patch("luoxu.db.search_vectors", wraps=search_vectors) as rank, \
+         patch("luoxu.db.revalidate_candidates", wraps=revalidate_candidates) as recheck:
+      rows = await self.search()
+    self.assertEqual([r["msgid"] for r in rows], [6, 5, 4])
+    self.assertEqual(rank.await_count, 1)
+    self.assertEqual(recheck.await_count, 1)
+    self.assertEqual([r["msgid"] for r in recheck.call_args.args[3]], [6, 5, 4])
+
+  async def test_new_superior_vector_does_not_evict_initial_window_or_replace_score(self):
+    await self.seed(1, "food")
+    await self.seed(2, "food two")
+    await self.backfill()
+    assert self.db.reranker is not None
+    self.db.reranker.candidates = 2
+    async def change():
+      await self.seed(3, "job superior")
+      await self.backfill()
+      async with self.db.get_conn() as conn:
+        # self.embeddings is the fixture's registry-UUID-derived identifier.
+        # pi-lens-ignore: python-sql-injection
+        await conn.execute(f"UPDATE {self.embeddings} SET embedding=$1::text::vector WHERE msgid=1",
+                           vector_literal(semantic_tests.vector()))
+    self.before_return = change
+    rows = await self.search()
+    self.assertEqual([r["msgid"] for r in rows], [2, 1])
+    self.assertEqual([r["vector_score"] for r in rows], [0, 0])
+    self.assertEqual(self.received[0]["texts"], ["food two", "food"])
+    self.before_return = None
+    # A later request gets its own current window; no snapshot across pages.
+    self.assertEqual([r["msgid"] for r in await self.search()], [3, 1])
+
+  async def test_inflight_embedding_metadata_model_hash_and_deletion(self):
+    for mid in range(1, 5):
+      await self.seed(mid, f"job {mid}")
+    await self.backfill()
+    async def change():
+      async with self.db.get_conn() as conn:
+        await conn.execute(f"UPDATE {self.embeddings} SET model='other' WHERE msgid=1")
+        await conn.execute(f"UPDATE {self.embeddings} SET content_hash='stale' WHERE msgid=2")
+        await conn.execute(f"DELETE FROM {self.embeddings} WHERE msgid=3")
+    self.before_return = change
+    self.assertEqual([r["msgid"] for r in await self.search()], [4])
+
+  async def test_inflight_time_topic_group_filters_and_reindexed_text(self):
+    async with self.db.get_conn() as conn:
+      topic = await self.db._ensure_conversation(
+        conn, "topic", "channel", 123, "Topic", topic_id=42, legacy_group_id=123,
+      )
+    for mid in range(1, 6):
+      await self.seed(mid, f"job {mid}")
+    await self.backfill()
+    async def change():
+      async with self.db.get_conn() as conn:
+        await conn.execute(f"DELETE FROM {self.embeddings} WHERE msgid IN (1, 2)")
+        await conn.execute(f"UPDATE {self.messages} SET created_at='2020-01-02' WHERE msgid=1")
+        await conn.execute(f"UPDATE {self.messages} SET conversation_id=$1 WHERE msgid=2", topic["id"])
+        await conn.execute(f"UPDATE {self.messages} SET group_id=NULL WHERE msgid=3")
+        await conn.execute(f"UPDATE {self.messages} SET text='job changed' WHERE msgid=4")
+      # Even a freshly eligible replacement vector cannot authorize old scores.
+      await self.backfill()
+    self.before_return = change
+    rows = await self.search(group=123, conversation_id=str(self.public),
+                             start=datetime.datetime(2024, 1, 1, tzinfo=UTC))
+    self.assertEqual([r["msgid"] for r in rows], [5])
+
+  async def test_topic_acl_is_rechecked_without_revoking_requested_parent(self):
+    async with self.db.get_conn() as conn:
+      topic = await self.db._ensure_conversation(
+        conn, "topic", "channel", 123, "Topic", topic_id=42, legacy_group_id=123,
+      )
+    await self.seed(1)
+    await self.seed(2, cid=topic["id"])
+    await self.backfill()
+    async def change():
+      # A topic no longer belonging to the granted parent loses inherited ACL.
+      async with self.db.get_conn() as conn:
+        await conn.execute("UPDATE conversations SET telegram_peer_id=999 WHERE id=$1", topic["id"])
+    self.before_return = change
+    self.assertEqual([r["msgid"] for r in await self.search()], [1])
+
+  async def test_empty_window_still_rechecks_authorization(self):
+    async def rank_then_revoke(*args):
+      rows = await search_vectors(*args)
+      self.assertEqual(rows, [])
+      await self.db.revoke_public(self.public)
+      return rows
+    with patch("luoxu.db.search_vectors", side_effect=rank_then_revoke) as rank:
+      with self.assertRaises(GroupNotFound):
+        await self.search()
+    self.assertEqual(rank.await_count, 1)
+    self.assertEqual(self.received, [])
 
   async def test_unavailable_and_malformed_are_503_without_fallback(self):
     await self.seed(1)
