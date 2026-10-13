@@ -88,7 +88,22 @@ paths:
         supported; both parameters, if supplied, must select the same archive.
         An inaccessible target returns 404. Each Telegram peer has independent
         ordinary message and optional embedding tables, without year partitions.
-        Keyword mode is the default and orders by time. Optional semantic mode
+        Keyword mode defaults to match=query and sort=time. Literal match is a
+        case-sensitive contiguous original-text substring, without trimming,
+        normalization/OpenCC or syntax parsing. Keyword sort=relevance scores ALL
+        eligible live/snapshot matches before the page limit using deterministic
+        database lexical counts, independent of execution plan, never model calls.
+        Query score is coalesce(array_length(pgroonga_match_positions_character(text,
+        pgroonga_query_extract_keywords(transformed_query)),1),0): normalized positive
+        hit spans (keywords extracted once). Negative-only queries can score zero.
+        Literal score is (char_length(text)-char_length(replace(text,q,'')))/char_length(q),
+        counting non-overlapping exact occurrences. These integers are not native
+        pgroonga_score, BM25, probabilities or semantic similarity. Relevance order is
+        score, created_at, msgid, conversation_id descending. Literal time order uses
+        the same tie break without score. Literal scans and full relevance scoring
+        can be expensive; narrow scope/time. A transaction-local statement timeout
+        caps each new-feature statement at 10s, preserving stricter owner settings.
+        Timeout is explicit 503, never silent fallback. Optional semantic mode
         ranks indexed messages by cosine similarity across all years, subject to
         the same grants and filters. It does not interpret names/time from q,
         generate answers, or apply keyword operators. Results may be incomplete
@@ -103,8 +118,7 @@ paths:
         archived message variant, with current access checks and enabled
         history. Does not search arbitrary edits or restore current text.
         Missing deletion snapshots return html=null only without keywords.
-        Both sources share filters, original-message-time ordering and the
-        50-row limit. Opt-in responses are private, no-store. Public snapshots
+        Both sources share filters, the requested ordering and the 50-row limit. Opt-in responses are private, no-store. Public snapshots
         are also accessible to anonymous visitors explicitly opting in.
         Semantic mode excludes deleted snapshots and rejects include_deleted=true.
       parameters:
@@ -114,6 +128,24 @@ paths:
             type: string
             enum: [keyword, semantic]
             default: keyword
+        - name: match
+          in: query
+          description: >-
+            Keyword matching. Literal preserves the complete raw query, including
+            whitespace-only values. Nondefault options in semantic mode return 400.
+          schema:
+            type: string
+            enum: [query, literal]
+            default: query
+        - name: sort
+          in: query
+          description: >-
+            Keyword ordering. Relevance uses database-only integer hit counts and
+            offset pagination. Nondefault options in semantic mode return 400.
+          schema:
+            type: string
+            enum: [time, relevance]
+            default: time
         - name: min_score
           in: query
           description: >-
@@ -127,9 +159,11 @@ paths:
         - name: offset
           in: query
           description: >-
-            Semantic-only pagination. Start at 0, then use next_offset from the
-            response (not the last message timestamp). Keep all filters unchanged.
-            Pages may shift as messages or permissions change.
+            Semantic or keyword/relevance pagination. Nonzero offsets with
+            keyword/time return 400. Start at 0, then use next_offset (not the last
+            timestamp) with unchanged filters. Relevance uses a 51st-row lookahead
+            after combined ranking. Pages may shift as messages or permissions
+            change; there is no cross-request snapshot.
           schema:
             type: integer
             minimum: 0
@@ -147,7 +181,12 @@ paths:
             format: uuid
         - name: q
           in: query
-          description: Semantic mode requires a nonblank natural-language query of at most 2000 characters.
+          description: >-
+            Semantic mode requires nonblank natural language, at most 2000 characters.
+            Keyword literal/relevance requires 1-2000 characters; query-syntax
+            relevance must be nonblank and valid. Literal preserves all whitespace.
+            Empty q for new options or NUL returns 400. Omitted or empty q browses
+            messages in default keyword/query/time mode.
           schema:
             type: string
         - name: sender
@@ -190,6 +229,9 @@ paths:
             next_offset (integer or null), and active ranking score per message.
             Reranked messages also carry original vector_score. html is escaped original text,
             not highlighted generated content. Both modes include deletion provenance.
+            New keyword options return mode, match, sort, ranking and score_kind;
+            relevance also returns integer message score, page_size=50 and next_offset.
+            Literal highlights split raw text before escaping, preserving entities.
           content:
             application/json:
               schema:
@@ -201,7 +243,7 @@ paths:
         '404':
           description: Conversation not accessible
         '503':
-          description: Semantic search disabled, migration missing, or embedding/reranking service unavailable, busy, timed out or malformed; never silently falls back
+          description: Database text search timed out; or semantic search disabled, migration missing, or embedding/reranking service unavailable, busy, timed out or malformed; never silently falls back
   /names:
     get:
       summary: Search sender names within one accessible group or conversation
@@ -703,16 +745,28 @@ components:
         has_more:
           type: boolean
           description: >-
-            Keyword mode reaches the 50-row cap; semantic mode has a next page
-            within the offset bound. Not a total-count assertion.
+            Keyword/time reaches the 50-row cap; semantic and keyword/relevance
+            have a next page within the offset bound. Not a total-count assertion.
         mode:
           type: string
-          enum: [semantic]
-          description: Present only for semantic mode
+          enum: [keyword, semantic]
+          description: Present for semantic mode or new keyword match/sort options
+        match:
+          type: string
+          enum: [query, literal]
+          description: Present for new keyword options
+        sort:
+          type: string
+          enum: [time, relevance]
+          description: Present for new keyword options
+        score_kind:
+          type: [string, 'null']
+          enum: [pgroonga_hit_spans, literal_occurrences, null]
+          description: New keyword score meaning; null for literal/time
         ranking:
           type: string
-          enum: [vector, reranker]
-          description: Present only for semantic mode; determines score meaning
+          enum: [vector, reranker, database_lexical, time]
+          description: Present for semantic or new keyword options; determines score meaning
         min_score:
           type: [number, 'null']
           minimum: 0
@@ -722,7 +776,7 @@ components:
           type: integer
           minimum: 1
           maximum: 50
-          description: Semantic page bound; default 20 with reranking, otherwise 50
+          description: Keyword relevance page bound 50; semantic default 20 with reranking, otherwise 50
         candidates:
           type: [integer, 'null']
           minimum: 1
@@ -732,7 +786,7 @@ components:
           type: [integer, 'null']
           minimum: 0
           maximum: 1000
-          description: Present only for semantic mode; null when no next page
+          description: Present for semantic or keyword/relevance; null when no next page within bound
         messages:
           type: array
           maxItems: 50
@@ -767,13 +821,14 @@ components:
           type: number
           description: >-
             Original creation time in Unix seconds; controls date filtering
-            and keyword ordering, not semantic ranking
+            and time ordering; tie break for keyword relevance, not semantic ranking
         score:
           type: number
           description: >-
-            Semantic-only active ranking score. Cosine similarity for ranking=vector;
-            sigmoid(logit) relevance in 0-1 for ranking=reranker, NOT calibrated
-            correctness probability.
+            Active ranking score. For database_lexical, a nonnegative integer
+            count with meaning given by score_kind (not probability or native
+            pgroonga_score). Cosine similarity for ranking=vector; sigmoid(logit)
+            relevance in 0-1 for ranking=reranker, NOT calibrated correctness probability.
         vector_score:
           type: number
           description: Original cosine similarity, present only with reranking

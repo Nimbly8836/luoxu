@@ -20,6 +20,9 @@ from .semantic import (
 )
 from .rerank import RerankerClient, valid_score
 from .types import GroupNotFound, SearchQuery
+from .text_search import (
+  advanced_text_search, search_text, set_text_search_timeout, validate_text_options,
+)
 from .storage import ArchiveConnection, conversation_archive
 from .util import UpdateLoaded, format_name
 
@@ -920,6 +923,7 @@ class PostgreStore:
     return ArchiveConnection(conn, target["archive_id"]), allowed or [], info
 
   async def search(self, q: SearchQuery, principal: Principal):
+    validate_text_options(q)
     if q.min_score is not None and (
       q.mode != "semantic" or self.reranker is None or not valid_score(q.min_score)
     ):
@@ -933,8 +937,12 @@ class PostgreStore:
       if q.include_deleted:
         # Isolation must precede ACL/routing reads as well as both content reads.
         await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+      if advanced_text_search(q):
+        await set_text_search_timeout(conn)
       scoped, allowed, groupinfo = await self._search_scope(conn, q, principal)
       if q.mode == "keyword":
+        if advanced_text_search(q):
+          return groupinfo, await search_text(scoped, q, allowed, self.SEARCH_LIMIT)
         return groupinfo, await self._search_keywords(scoped, q, allowed)
     if q.mode != "semantic":
       raise ValueError("unknown search mode")

@@ -37,9 +37,11 @@ enabled = true
 
 快照按会话 UUID、消息 ID 和原消息创建时间匹配，不会从另一会话或另一年份的同号消息借用正文。若同一记录保留多份删除快照，先按捕获时间、再按快照 ID 选择最新一份。
 
-`q` 的匹配与高亮使用同一份正文；正文中的 HTML 被转义，关键词由 PGroonga 高亮。`g`、`conversation_id`、`sender`、`exclude_sender`、`start`、`end` 对两类结果都生效。发送者排除优先于包含条件，未知发送者仍遵循原规则。
+`q` 的匹配与高亮使用同一份正文，正文中的 HTML 被转义。默认 `match=query` 使用 PGroonga 高亮；`match=literal` 按原样连续子串匹配，先切分原文再转义高亮，保留大小写、繁简和空白。`g`、`conversation_id`、`sender`、`exclude_sender`、`start`、`end` 对两类结果都生效。发送者排除优先于包含条件，未知发送者仍遵循原规则。
 
-日期过滤和排序使用**原消息创建时间**，不是删除时间。正常和删除结果合并后，按原有创建时间、消息 ID 倒序，使用相同的 50 条搜索上限和 `has_more` 语义；已删除消息也占用该上限。
+日期过滤使用**原消息创建时间**，不是删除时间。默认 `match=query&sort=time` 下，正常和删除结果合并后，仍按原有创建时间、消息 ID 倒序，使用相同的 50 条搜索上限和 `has_more` 语义；已删除消息也占用该上限。
+
+`sort=relevance` 会对两类命中统一按数据库文本分数排序，每页 50 条，通过额外一条结果判断 `has_more`，并使用 `next_offset` 翻页，而不是最后一条消息的时间。它可以与 `match=literal` 组合；具体计分、边界和开销见[普通数据库搜索](ordinary-search.md)。
 
 这是“当前消息 + 显式删除快照”搜索，不是任意编辑历史全文搜索。给 `/search` 传 `include_history=true` 不能替代此参数。
 

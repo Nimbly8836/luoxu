@@ -25,6 +25,7 @@ from .group import MonitoringUnavailable
 from .semantic import MAX_OFFSET, MAX_QUERY_CHARS, SemanticUnavailable
 from .rerank import valid_score
 from .types import GroupNotFound, SearchQuery
+from .text_search import advanced_text_search, validate_text_options
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +202,7 @@ def html_or_text(m):
 
 class SearchHandler(BaseHandler):
   async def _get(self, request):
+    q = None
     try:
       q = self._parse_query(request.query)
       if q.include_deleted and not request.app["history_enabled"]:
@@ -212,6 +214,13 @@ class SearchHandler(BaseHandler):
       raise web.HTTPBadRequest from exc
     except GroupNotFound as exc:
       raise web.HTTPNotFound from exc
+    except asyncpg.QueryCanceledError:
+      if q is None or not advanced_text_search(q):
+        raise
+      return web.json_response(
+        {"error": "database text search timed out; narrow the scope or time range"},
+        status=503, headers={"Cache-Control": "private, no-store"},
+      )
     except SemanticUnavailable as exc:
       return web.json_response(
         {"error": str(exc)}, status=503, headers={"Cache-Control": "private, no-store"}
@@ -219,7 +228,8 @@ class SearchHandler(BaseHandler):
     semantic = q.mode == "semantic"
     reranker = self.dbconn.reranker if semantic else None
     limit = reranker.page_size if reranker else self.dbconn.SEARCH_LIMIT
-    has_more = len(messages) > limit if semantic else len(messages) == limit
+    relevance = q.mode == "keyword" and q.sort == "relevance"
+    has_more = len(messages) > limit if semantic or relevance else len(messages) == limit
     metadata = {}
     if semantic:
       metadata = {
@@ -231,6 +241,20 @@ class SearchHandler(BaseHandler):
         "next_offset": q.offset + limit if has_more and q.offset + limit <= MAX_OFFSET else None,
       }
       has_more = metadata["next_offset"] is not None
+    if advanced_text_search(q):
+      metadata = {
+        "mode": "keyword", "match": q.match, "sort": q.sort,
+        "ranking": "database_lexical" if relevance else "time",
+        "score_kind": (
+          "literal_occurrences" if q.match == "literal" else "pgroonga_hit_spans"
+        ) if relevance else None,
+      }
+      if relevance:
+        metadata.update({
+          "page_size": limit,
+          "next_offset": q.offset + limit if has_more and q.offset + limit <= MAX_OFFSET else None,
+        })
+        has_more = metadata["next_offset"] is not None
     return web.json_response(
       {
         "groupinfo": groupinfo,
@@ -243,10 +267,11 @@ class SearchHandler(BaseHandler):
             "from_id": m["from_user"],
             "from_name": m["from_user_name"],
             "group_id": m["group_id"],
-            "html": html_or_text(m) if m["text"] is not None else None,
+            "html": (m["html"] if q.match == "literal" else html_or_text(m))
+                    if m["text"] is not None else None,
             "t": m["created_at"].timestamp(),
             "edited": m["updated_at"].timestamp() if m["updated_at"] else None,
-            **({"score": m["score"]} if semantic else {}),
+            **({"score": m["score"]} if semantic or relevance else {}),
             **({"vector_score": m["vector_score"]} if reranker else {}),
             "deleted": m["deleted_at"] is not None,
             "deleted_at": m["deleted_at"].timestamp() if m["deleted_at"] else None,
@@ -283,8 +308,8 @@ class SearchHandler(BaseHandler):
     if mode not in ("keyword", "semantic"):
       raise web.HTTPBadRequest(text="mode must be keyword or semantic")
     offset = _int(query.get("offset", 0), "offset")
-    if not 0 <= offset <= MAX_OFFSET or (mode == "keyword" and offset != 0):
-      raise web.HTTPBadRequest(text="offset is only supported for semantic search (0-1000)")
+    if not 0 <= offset <= MAX_OFFSET:
+      raise web.HTTPBadRequest(text="offset must be in 0-1000")
     if mode == "semantic" and (not terms or not terms.strip() or len(terms) > MAX_QUERY_CHARS):
       raise web.HTTPBadRequest(text="semantic q must contain 1-2000 characters")
     if start and end and start >= end:
@@ -302,7 +327,7 @@ class SearchHandler(BaseHandler):
         raise web.HTTPBadRequest(text="invalid min_score") from exc
       if mode != "semantic" or not valid_score(min_score):
         raise web.HTTPBadRequest(text="min_score requires semantic mode and a number in 0-1")
-    return SearchQuery(
+    parsed = SearchQuery(
       group, terms, sender, start, end,
       conversation_id=conversation_id,
       exclude_sender=exclude_sender,
@@ -310,7 +335,14 @@ class SearchHandler(BaseHandler):
       offset=offset,
       include_deleted=include_deleted == "true",
       min_score=min_score,
+      match=query.get("match", "query"),
+      sort=query.get("sort", "time"),
     )
+    try:
+      validate_text_options(parsed)
+    except ValueError as exc:
+      raise web.HTTPBadRequest(text=str(exc)) from exc
+    return parsed
 
   @staticmethod
   def _parse_sender(sender):

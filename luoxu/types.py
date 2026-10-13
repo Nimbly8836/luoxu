@@ -14,6 +14,8 @@ class SearchQuery(NamedTuple):
   offset: int = 0
   include_deleted: bool = False
   min_score: float | None = None
+  match: str = "query"
+  sort: str = "time"
 
 
 class GroupNotFound(Exception):

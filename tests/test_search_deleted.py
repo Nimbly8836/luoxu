@@ -17,7 +17,7 @@ UTC = datetime.timezone.utc
 
 
 @unittest.skipUnless(fixtures.DATABASE_URL, "set LUOXU_TEST_DATABASE_URL")
-class DeletedSearchTests(unittest.IsolatedAsyncioTestCase):
+class DeletedSearchFixture(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self):
     self.fixture = fixtures.TopicStorageTests(
       "test_ordinary_reply_ingestion_lists_only_one_group"
@@ -81,6 +81,8 @@ class DeletedSearchTests(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(response.status, 404, await response.text())
     self.assertNotIn("needle", await response.text())
 
+
+class DeletedSearchTests(DeletedSearchFixture):
   async def test_scope_is_required_and_conflicting_archive_is_rejected(self):
     response = await self.client.get(
       PREFIX + "/search", params={"include_deleted": "true", "q": "needle"}
