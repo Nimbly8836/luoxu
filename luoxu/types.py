@@ -16,6 +16,7 @@ class SearchQuery(NamedTuple):
   min_score: float | None = None
   match: str = "query"
   sort: str = "time"
+  order: str = "desc"
 
 
 class GroupNotFound(Exception):

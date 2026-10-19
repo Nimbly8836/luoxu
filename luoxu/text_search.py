@@ -21,6 +21,10 @@ def validate_text_options(q: SearchQuery) -> None:
     raise ValueError("unknown search mode")
   if q.match not in ("query", "literal") or q.sort not in ("time", "relevance"):
     raise ValueError("match must be query or literal; sort must be time or relevance")
+  if q.order not in ("asc", "desc"):
+    raise ValueError("order must be asc or desc")
+  if q.order == "asc" and (q.mode != "keyword" or q.sort != "time"):
+    raise ValueError("order=asc requires keyword mode with sort=time")
   if q.mode == "semantic":
     if q.match != "query" or q.sort != "time":
       raise ValueError("match and sort options require keyword mode")
@@ -77,7 +81,11 @@ async def search_text(conn, q: SearchQuery, allowed, limit: int):
     "coalesce(array_length(pgroonga_match_positions_character(text, $10::text[]), 1), 0)"
   ) if q.sort == "relevance" else "NULL::integer"
   order = "score DESC, " if q.sort == "relevance" else ""
-  order += "created_at DESC, msgid DESC, conversation_id DESC"
+  # Complete server-owned clauses: never interpolate a request as SQL.
+  order += (
+    "created_at ASC, msgid ASC, conversation_id ASC" if q.order == "asc"
+    else "created_at DESC, msgid DESC, conversation_id DESC"
+  )
   rows = await conn.fetch(
     """
     WITH eligible AS NOT MATERIALIZED (

@@ -88,7 +88,9 @@ paths:
         supported; both parameters, if supplied, must select the same archive.
         An inaccessible target returns 404. Each Telegram peer has independent
         ordinary message and optional embedding tables, without year partitions.
-        Keyword mode defaults to match=query and sort=time. Literal match is a
+        Keyword mode defaults to match=query, sort=time and order=desc (newest
+        first). With sort=time, order=asc selects the oldest eligible messages
+        first, before LIMIT; it does not reverse the newest page. Literal match is a
         case-sensitive contiguous original-text substring, without trimming,
         normalization/OpenCC or syntax parsing. Keyword sort=relevance scores ALL
         eligible live/snapshot matches before the page limit using deterministic
@@ -99,8 +101,9 @@ paths:
         Literal score is (char_length(text)-char_length(replace(text,q,'')))/char_length(q),
         counting non-overlapping exact occurrences. These integers are not native
         pgroonga_score, BM25, probabilities or semantic similarity. Relevance order is
-        score, created_at, msgid, conversation_id descending. Literal time order uses
-        the same tie break without score. Literal scans and full relevance scoring
+        score, created_at, msgid, conversation_id descending. Ascending time order
+        uses created_at, msgid, conversation_id ascending; literal time order uses
+        the same keys in the requested direction, without score. Literal scans and full relevance scoring
         can be expensive; narrow scope/time. A transaction-local statement timeout
         caps each new-feature statement at 10s, preserving stricter owner settings.
         Timeout is explicit 503, never silent fallback. Optional semantic mode
@@ -146,6 +149,21 @@ paths:
             type: string
             enum: [time, relevance]
             default: time
+        - name: order
+          in: query
+          description: >-
+            Keyword sort=time direction: asc means oldest first, desc newest first.
+            Applies before LIMIT to both live messages and deletion snapshots.
+            Ascending requires keyword/time; it is rejected with relevance or
+            semantic ranking. The default desc leaves those rankings unchanged.
+            Query-mode time browsing still accepts omitted/empty q. Time paging
+            keeps the 50-row cap: advance start for asc or end for desc, keeping
+            other filters. Date bounds are exclusive, not full-key cursors; a
+            timestamp tie spanning a page can be skipped by timestamp-only paging.
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
         - name: min_score
           in: query
           description: >-
@@ -185,8 +203,8 @@ paths:
             Semantic mode requires nonblank natural language, at most 2000 characters.
             Keyword literal/relevance requires 1-2000 characters; query-syntax
             relevance must be nonblank and valid. Literal preserves all whitespace.
-            Empty q for new options or NUL returns 400. Omitted or empty q browses
-            messages in default keyword/query/time mode.
+            Empty q for literal/relevance or NUL returns 400. Omitted or empty q
+            browses messages in keyword/query/time mode, with either time direction.
           schema:
             type: string
         - name: sender
@@ -750,7 +768,7 @@ components:
         mode:
           type: string
           enum: [keyword, semantic]
-          description: Present for semantic mode or new keyword match/sort options
+          description: Present for semantic mode or new keyword match/sort/order options
         match:
           type: string
           enum: [query, literal]
@@ -759,10 +777,14 @@ components:
           type: string
           enum: [time, relevance]
           description: Present for new keyword options
+        order:
+          type: string
+          enum: [asc, desc]
+          description: Present for keyword/time when order is explicit or match=literal
         score_kind:
           type: [string, 'null']
           enum: [pgroonga_hit_spans, literal_occurrences, null]
-          description: New keyword score meaning; null for literal/time
+          description: New keyword score meaning; null for time ordering
         ranking:
           type: string
           enum: [vector, reranker, database_lexical, time]

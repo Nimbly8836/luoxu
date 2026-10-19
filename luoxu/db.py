@@ -937,7 +937,7 @@ class PostgreStore:
       if q.include_deleted:
         # Isolation must precede ACL/routing reads as well as both content reads.
         await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-      if advanced_text_search(q):
+      if advanced_text_search(q) or q.order == "asc":
         await set_text_search_timeout(conn)
       scoped, allowed, groupinfo = await self._search_scope(conn, q, principal)
       if q.mode == "keyword":
@@ -991,6 +991,11 @@ class PostgreStore:
     query = text_to_query(q.terms.strip()) if q.terms else None
     if q.terms and not query:
       raise ValueError
+    # Fixed SQL alternatives only; select the oldest/newest matches BEFORE LIMIT.
+    order = (
+      "m.created_at ASC, m.msgid ASC, m.conversation_id ASC" if q.order == "asc"
+      else "m.created_at DESC, m.msgid DESC"
+    )
     rows = await conn.fetch(
       """
       SELECT m.msgid, m.conversation_id, m.group_id, m.from_user,
@@ -1007,8 +1012,7 @@ class PostgreStore:
         AND ($7::bigint[] IS NULL OR m.from_user = ANY($7))
         AND ($9::bigint[] IS NULL OR m.from_user IS NULL
              OR NOT (m.from_user = ANY($9)))
-      ORDER BY m.created_at DESC, m.msgid DESC LIMIT $8
-      """,
+      ORDER BY """ + order + " LIMIT $8",
       allowed or [],
       q.start,
       q.end,
@@ -1045,8 +1049,7 @@ class PostgreStore:
           AND ($7::bigint[] IS NULL OR m.from_user = ANY($7))
           AND ($9::bigint[] IS NULL OR m.from_user IS NULL
                OR NOT (m.from_user = ANY($9)))
-        ORDER BY m.created_at DESC, m.msgid DESC LIMIT $8
-        """,
+        ORDER BY """ + order + " LIMIT $8",
         allowed or [],
         q.start,
         q.end,
@@ -1059,8 +1062,11 @@ class PostgreStore:
       )
       rows = sorted(
         [*rows, *deleted_rows],
-        key=lambda row: (row["created_at"], row["msgid"]),
-        reverse=True,
+        key=lambda row: (
+          (row["created_at"], row["msgid"], row["conversation_id"])
+          if q.order == "asc" else (row["created_at"], row["msgid"])
+        ),
+        reverse=q.order == "desc",
       )[: self.SEARCH_LIMIT]
     if query and rows:
       # Highlight exactly the authorized, limited texts already selected,

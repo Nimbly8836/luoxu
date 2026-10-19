@@ -215,7 +215,7 @@ class SearchHandler(BaseHandler):
     except GroupNotFound as exc:
       raise web.HTTPNotFound from exc
     except asyncpg.QueryCanceledError:
-      if q is None or not advanced_text_search(q):
+      if q is None or (not advanced_text_search(q) and q.order != "asc"):
         raise
       return web.json_response(
         {"error": "database text search timed out; narrow the scope or time range"},
@@ -241,7 +241,9 @@ class SearchHandler(BaseHandler):
         "next_offset": q.offset + limit if has_more and q.offset + limit <= MAX_OFFSET else None,
       }
       has_more = metadata["next_offset"] is not None
-    if advanced_text_search(q):
+    if advanced_text_search(q) or q.order == "asc" or (
+      q.mode == "keyword" and q.sort == "time" and "order" in request.query
+    ):
       metadata = {
         "mode": "keyword", "match": q.match, "sort": q.sort,
         "ranking": "database_lexical" if relevance else "time",
@@ -249,6 +251,8 @@ class SearchHandler(BaseHandler):
           "literal_occurrences" if q.match == "literal" else "pgroonga_hit_spans"
         ) if relevance else None,
       }
+      if q.sort == "time":
+        metadata["order"] = q.order
       if relevance:
         metadata.update({
           "page_size": limit,
@@ -337,6 +341,7 @@ class SearchHandler(BaseHandler):
       min_score=min_score,
       match=query.get("match", "query"),
       sort=query.get("sort", "time"),
+      order=query.get("order", "desc"),
     )
     try:
       validate_text_options(parsed)

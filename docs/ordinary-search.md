@@ -11,10 +11,14 @@ Frontend controls/integration are separate; this repository supplies the API onl
 
 ## Request contract
 
-- `mode=keyword` (default), `match=query` (default), `sort=time` (default) preserve
+- `mode=keyword` (default), `match=query` (default), `sort=time` (default), and
+  `order=desc` (default) preserve
   existing AND/OR/negative/parenthesis syntax, OpenCC expansion, highlighting and
   descending original-message-time pagination. Omitting `q` or sending `q=` still
-  browses messages in this default mode. NUL is rejected with 400.
+  browses messages in query/time mode, including `order=asc`. NUL is rejected with 400.
+- `order=asc` returns oldest messages first; `order=desc` returns newest first.
+  Ascending requires keyword/time, and is rejected with relevance or semantic
+  ranking. Explicit `desc` preserves those rankings' existing behavior.
 - `match=literal` bypasses operator parsing, trimming, case folding and OpenCC.
   Spaces (including whitespace-only queries), newlines, punctuation, quotes,
   backslashes, `%`, `_`, Chinese variants and emoji are significant. URL-encode
@@ -37,8 +41,33 @@ Frontend controls/integration are separate; this repository supplies the API onl
 ## Ranking and response
 
 New options return `mode=keyword`, `match`, `sort`, `ranking`, and `score_kind`.
-Literal/time uses `ranking=time`, `score_kind=null`, no per-message score, and
-legacy 50-row/date pagination. Default query/time responses are unchanged.
+Time ordering uses `ranking=time`, `score_kind=null`, no per-message score, and
+legacy 50-row/date pagination. Explicit time `order` (or literal/time) also returns
+`order=asc|desc`. Default query/time responses without `order` remain unchanged.
+
+### Time direction and paging
+
+```http
+GET /luoxu/search?g=456&sort=time&order=asc
+GET /luoxu/search?g=456&q=test&sort=time&order=desc
+GET /luoxu/search?g=456&q=test&match=literal&sort=time&order=asc&include_deleted=true
+```
+
+Direction selects the oldest/newest **eligible matches before LIMIT**, not a
+reversal of the newest 50 messages. Both live and deleted results use original
+creation time, never edit/deletion time; latest-snapshot selection is unchanged.
+Ascending ties use message ID then conversation UUID, also ascending.
+
+Time paging still returns at most 50 messages, with `has_more` meaning that the
+cap was reached (not proof of another page). It does not use `next_offset` and
+rejects nonzero `offset`. To move forward in ascending order, advance `start` to
+the last returned `t`; to move backward in descending order, move `end` to that
+`t`, keeping other filters. These date bounds are exclusive. **This legacy
+paging is not a full-key cursor**: equal timestamps spanning a page boundary can
+be skipped by timestamp-only paging. This change does not promise exhaustive
+traversal or cross-request snapshot consistency.
+
+### Relevance
 
 Relevance uses `ranking=database_lexical` and a nonnegative **integer** `score`:
 
@@ -61,7 +90,8 @@ Both scoring rules apply equally to live and snapshot text and are independent
 of index-versus-sequential execution plans. Every eligible matching row is scored
 before LIMIT, **not just the newest 50**. Order is score descending, creation time
 descending, message ID descending, then conversation UUID descending (full
-physical-key tie break). Literal/time uses the same tie order without score.
+physical-key tie break). Literal/time uses the same keys without score,
+in the requested `order` direction.
 
 Relevance returns `page_size=50`, `next_offset` (integer or null), and `has_more`.
 Start with `offset=0`, then send `next_offset` with unchanged filters. Offset is
@@ -81,7 +111,7 @@ Responses retain `Cache-Control: private, no-store` and `Vary: Authorization`.
 Literal search may scan all eligible original text, including whitespace-only
 queries. Relevance must score all eligible matches, and snapshot reads add work.
 Narrow the group/conversation and creation-time range on large archives. New
-search work uses transaction-local `statement_timeout` capped at 10 seconds per
+search work (including ascending time search) uses transaction-local `statement_timeout` capped at 10 seconds per
 statement; an already stricter nonzero owner timeout is preserved. No global
 configuration changes occur. Timeout returns explicit HTTP 503 and never silently
 falls back to time ordering, semantic search or incomplete results.
