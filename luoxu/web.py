@@ -159,7 +159,9 @@ async def _require_telegram_member(request, telegram_id, user_id):
       or auth.accounts.get(telegram_id) != str(user_id)):
     raise web.HTTPUnauthorized(text="invalid Telegram account binding", headers=headers)
   try:
-    allowed = await auth.is_indexed_group_member(request.app["db"], telegram_id)
+    allowed = await auth.is_indexed_group_member(
+      request.app["db"], telegram_id, request.app.get("telegram_client"),
+    )
   except MembershipUnavailable:
     raise web.HTTPServiceUnavailable(text="Telegram membership check unavailable", headers=headers) from None
   if not allowed:
@@ -1093,6 +1095,7 @@ def setup_app(
   app = web.Application(middlewares=[cors_middleware, auth_middleware])
   app["origins"] = origins
   app["db"], app["auth"] = dbconn, auth_service
+  app["telegram_client"] = client
   app["history_enabled"] = history_enabled
   app["context"] = {
     "before": 5,

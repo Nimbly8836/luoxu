@@ -85,7 +85,11 @@ enabled = false
 bot_token_env = "LUOXU_TELEGRAM_BOT_TOKEN"
 max_age = 300 # seconds, allowed range 30-3600; launch data is single-use
 # Must belong to at least one currently indexed group (durable references > 0).
-# Rechecked on Telegram-session requests and refresh. Bot must be able to query members.
+# Rechecked on Telegram-session requests and refresh.
+# auto: existing indexer MTProto client first, Bot API only if unable to determine.
+# userbot: MTProto only (requires core); bot: Bot API only (also supports web-only).
+# The Bot token is still required for initData verification in all modes.
+membership_source = "auto"
 membership_cache_ttl = 60 # seconds, 0-300; maximum delay for noticing membership removal
 # Explicit bindings only: no automatic signup, username matching or group grants.
 # [[web.auth.telegram.accounts]]

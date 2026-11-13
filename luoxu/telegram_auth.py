@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from urllib.parse import parse_qsl
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
+from telethon.errors import RPCError, UserNotParticipantError
+from telethon.tl import functions, types
 
 
 class MembershipUnavailable(Exception):
@@ -37,6 +39,9 @@ class TelegramAuth:
     self.secret = b""
     self._token = ""
     self._members = OrderedDict()
+    self.membership_source = config.get("membership_source", "auto")
+    if self.membership_source not in ("auto", "userbot", "bot"):
+      raise ValueError("telegram.membership_source must be auto, userbot or bot")
     self.membership_cache_ttl = config.get("membership_cache_ttl", 60)
     if type(self.membership_cache_ttl) is not int or not 0 <= self.membership_cache_ttl <= 300:
       raise ValueError("telegram.membership_cache_ttl must be 0 to 300 seconds")
@@ -121,7 +126,63 @@ class TelegramAuth:
     except (ClientError, TimeoutError, ValueError, AttributeError):
       raise MembershipUnavailable from None
 
-  async def is_indexed_group_member(self, db, telegram_id):
+  async def _lookup_userbot_member(self, client, chat_id, telegram_id):
+    """Use the existing indexer client; never create or log in another session."""
+    if client is None or not client.is_connected():
+      raise MembershipUnavailable
+    try:
+      if chat_id <= -1000000000000:
+        channel = await client.get_input_entity(types.PeerChannel(-chat_id - 1000000000000))
+        user = await client.get_input_entity(types.PeerUser(telegram_id))
+        result = await client(
+          functions.channels.GetParticipantRequest(channel, user),
+          flood_sleep_threshold=0,
+        )
+        member = result.participant
+        if isinstance(member, (types.ChannelParticipant, types.ChannelParticipantSelf,
+                               types.ChannelParticipantAdmin, types.ChannelParticipantCreator)):
+          if member.user_id != telegram_id:
+            raise MembershipUnavailable
+          return True
+        if isinstance(member, (types.ChannelParticipantLeft, types.ChannelParticipantBanned)):
+          if not isinstance(member.peer, types.PeerUser) or member.peer.user_id != telegram_id:
+            raise MembershipUnavailable
+          if isinstance(member, types.ChannelParticipantLeft):
+            return False
+          return not (member.left or member.banned_rights.view_messages)
+        raise MembershipUnavailable
+      result = await client(functions.messages.GetFullChatRequest(-chat_id),
+                            flood_sleep_threshold=0)
+      participants = result.full_chat.participants
+      if result.full_chat.id != -chat_id or participants.chat_id != -chat_id:
+        raise MembershipUnavailable
+      if isinstance(participants, types.ChatParticipants):
+        return any(p.user_id == telegram_id for p in participants.participants)
+      # Forbidden lists cannot prove absence; a returned self-participant can
+      # still prove that specific user's membership, not everyone else's.
+      if isinstance(participants, types.ChatParticipantsForbidden):
+        member = participants.self_participant
+        if member is not None and member.user_id == telegram_id:
+          return True
+      raise MembershipUnavailable
+    except UserNotParticipantError:
+      return False
+    except (RPCError, OSError, ValueError, TypeError, AttributeError):
+      raise MembershipUnavailable from None
+
+  async def _check_member(self, session, client, chat_id, telegram_id):
+    if self.membership_source != "bot":
+      try:
+        return await asyncio.wait_for(
+          self._lookup_userbot_member(client, chat_id, telegram_id), timeout=4,
+        )
+      except (MembershipUnavailable, TimeoutError):
+        if self.membership_source == "userbot":
+          raise MembershipUnavailable from None
+        # Only indeterminate checks fall back. A confirmed nonmember does not.
+    return await self._lookup_member(session, chat_id, telegram_id)
+
+  async def is_indexed_group_member(self, db, telegram_id, client=None):
     # Re-read monitoring intent even when Telegram results are cached: stopped
     # archives, private chats and static index_groups are not admission sources.
     groups = await db.list_group_monitoring()
@@ -135,14 +196,14 @@ class TelegramAuth:
     try:
       async with asyncio.timeout(10), ClientSession(timeout=ClientTimeout(total=4)) as session:
         for chat_id in sorted(candidates):
-          key = (chat_id, telegram_id)
+          key = (self.membership_source, client is not None, chat_id, telegram_id)
           cached = self._members.get(key)
           if cached and cached[0] > time.monotonic():
             if cached[1]:
               return True
             continue
           try:
-            member = await self._lookup_member(session, chat_id, telegram_id)
+            member = await self._check_member(session, client, chat_id, telegram_id)
           except MembershipUnavailable:
             failed = True
             continue

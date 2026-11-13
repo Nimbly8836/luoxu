@@ -22,9 +22,10 @@ Mini App 登录需要同时满足：
 
 ```toml
 [web.auth.telegram]
-enabled = false # 准备好 token、迁移、Bot 群权限后才改 true
+enabled = false # 准备好 token、迁移、成员核验能力后才改 true
 bot_token_env = "LUOXU_TELEGRAM_BOT_TOKEN"
 max_age = 300
+membership_source = "auto"
 membership_cache_ttl = 60
 
 [[web.auth.telegram.accounts]]
@@ -33,12 +34,27 @@ user_id = "11111111-1111-4111-8111-111111111111"
 ```
 
 - `max_age`：启动数据有效期，30–3600 秒；最多允许未来 30 秒时钟偏差。
-- `membership_cache_ttl`：成员查询结果缓存，0–300 秒，默认 60。设 0 可禁用缓存，但会增加 Bot API 请求。
+- `membership_source`：`auto`（默认）、`userbot` 或 `bot`，详见下方。
+- `membership_cache_ttl`：成员查询结果缓存，0–300 秒，默认 60。设 0 可禁用缓存，但会增加 Telegram 请求。
 - `accounts` 可重复添加不同的 Telegram ID；重复 ID、非法 UUID 会在启动时报错。
 - Bot token 只放服务器环境变量，不放前端配置、URL、日志或版本库。应使用承载 Mini App 的 Bot token，与 Telethon 索引账号不同。
 - Compose 的 `core` / `web` 已预留 `LUOXU_TELEGRAM_BOT_TOKEN` 环境传递。默认关闭时可以不设置；开启后缺失/格式错误会阻止启动，避免误认为认证已经启用。
 
-成员核验调用 Bot API `getChatMember`。Bot 应加入需要核验的索引群并成为管理员，Telegram 才保证能够查询其他用户。`creator`、`administrator`、`member` 允许，`restricted` 仅 `is_member=true` 时允许；`left`、`kicked` 拒绝。网络失败、超时、限流或缺少查询权限时不放行；如果能明确核验另一个索引群的成员资格，仍可通过。
+### 两种成员核验方式
+
+| `membership_source` | 行为 |
+| --- | --- |
+| `auto`（默认） | 优先复用索引进程现有的 Telethon 用户客户端；无法确认时才对该群回退 Bot API。独立 Web 无用户客户端时直接尝试 Bot API。 |
+| `userbot` | 只使用索引用户客户端；无客户端、离线、权限不足或无法解析用户时返回不可用，不尝试 Bot API。 |
+| `bot` | 只使用 Bot API `getChatMember`，保留原实现，支持独立 Web 部署。 |
+
+**Userbot 方式不要求 Mini App Bot 加入索引群。** 它复用 `core` 里已登录的 Telegram 用户客户端，不新建会话、不再次登录、不改变索引客户端的代理或重试设置。超级群/频道使用 `channels.getParticipant`；普通群使用 `messages.getFullChat` 的成员元数据。群成员身份仍需由 Telegram 返回确认，索引账号本人或管理员也没有免检通道。未知用户的 access hash、成员隐藏、无查询权限、掉线或限流都只能作为“无法确认”，不能据此放行。查询有超时，FloodWait 不长时间挂住认证请求。
+
+Bot API 方式才要求 Bot 能访问目标群，通常应加入并设为管理员，以保证能查询其他用户。`creator`、`administrator`、`member` 允许，`restricted` 仅 `is_member=true` 时允许；`left`、`kicked` 拒绝。MTProto 的离群/踢出状态同样拒绝，禁言但仍在群的成员可通过。
+
+`auto` 中 Userbot **明确返回非成员时不对同一个群回退**，避免用另一来源覆盖明确拒绝；仍可检查其他索引群。只有无法确认（包括超时/缺权限）时回退。两种方式均无法确认时不放行。缓存按核验模式及用户客户端是否存在隔离；成员资格与原有归档授权边界不变。
+
+**即使使用 `userbot`，Bot token 仍然必需**：它用于验证 Mini App `initData`，与用哪个客户端查询群成员是两件事。已完成007迁移的部署切换核验模式不需要新迁移。
 
 Telegram 签发的 access/refresh token 保留认证来源，每个认证请求及刷新都检查当前绑定和群成员资格（允许使用有界缓存）。退出所有索引群后，最迟在成员缓存到期后的请求被拒绝；停止所有相关群的监听引用则下一次请求即不再使用这些群准入。身份绑定撤销或关闭 Telegram 登录也会拒绝已有 Telegram 会话。密码登录会话不受影响。
 
@@ -71,10 +87,10 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/007_telegram_login.sql
 后续上线顺序：
 
 1. 确认数据库备份和迁移，部署支持本接口的后端；保持前端开关关闭。
-2. 在服务器安全配置 token、账号绑定，将 Bot 加入所需索引群并设置查询成员所需权限，再启用后端并重启对应服务。
+2. 在服务器安全配置 token、账号绑定及核验方式。使用 `userbot`/`auto` 时确认索引客户端可查询成员；只依赖 Bot API 时将 Bot 加入所需群并设置相应权限。然后启用后端并重启对应服务。
 3. 部署 HTTPS 前端并开启前端开关；反向代理转发正确 API 前缀。若有 CSP，允许官方 SDK `https://telegram.org`；只为需要的 Telegram Web 宿主配置嵌入权限，不取消 API 鉴权。
 4. 在 BotFather 配置 Main Mini App 或菜单按钮 Web App URL 指向前端 HTTPS 地址。Telegram 内点击普通网页链接不等于 Mini App 启动。
-5. 真实客户端验收绑定成员、非成员、未绑定成员、退出群、停止监听、token 刷新、Bot 权限不足及密码回退。
+5. 真实客户端验收绑定成员、非成员、未绑定成员、退出群、停止监听、token 刷新、Userbot/Bot 查询不可用及密码回退。
 
 回滚时先关闭前端登录开关，再关闭后端 Telegram 登录，保留已有表即可。关闭后端后已有 Telegram 会话也会被拒绝，不影响密码会话。改账号权限仍按原有管理流程执行。
 
@@ -98,4 +114,4 @@ LUOXU_TEST_DATABASE_URL='postgresql://…/DISPOSABLE_TEST_DB' \
   python -m unittest discover -s tests -v
 ```
 
-测试使用合成启动签名和 Bot API 响应，不需要真实 token，不访问 Telegram。真实客户端及真实群核验须留待配置入口后验收。
+测试使用合成启动签名、Bot API 响应和 MTProto 客户端，不需要真实 token，不访问 Telegram。真实客户端及真实群核验须留待配置入口后验收。
