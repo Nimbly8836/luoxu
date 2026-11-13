@@ -99,6 +99,12 @@ paths:
   /auth/me:
     get:
       summary: Get the current authenticated user
+      description: >-
+        Telegram profiles declare auth_source=telegram and scope version 1.
+        When private-chat commands are enabled, default_group_id is the user's
+        saved group ID as a string, or null if unset or no longer in the current
+        verified scope. Web profiles do not expose this Telegram preference.
+        Defaults never expand access or override explicit launch parameters.
       security:
         - bearerAuth: []
       responses:

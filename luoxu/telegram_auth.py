@@ -34,6 +34,12 @@ class TelegramAuth:
     self.enabled = config.get("enabled", False)
     if not isinstance(self.enabled, bool):
       raise ValueError("telegram.enabled must be a boolean")
+    commands = config.get("commands", {})
+    if not isinstance(commands, dict) or type(commands.get("enabled", False)) is not bool:
+      raise ValueError("telegram.commands.enabled must be a boolean")
+    self.commands_enabled = commands.get("enabled", False)
+    if self.commands_enabled and not self.enabled:
+      raise ValueError("Telegram commands require Telegram authentication enabled")
     self.accounts = {}
     self.owner_telegram_id = config.get("owner_telegram_id")
     if self.owner_telegram_id is not None and (

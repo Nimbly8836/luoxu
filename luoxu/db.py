@@ -104,6 +104,11 @@ class PostgreStore:
                   AND to_regclass('auth_telegram_launches') IS NOT NULL"""
       ):
         raise RuntimeError("Telegram login requires migrations 007 and 008")
+      if auth_service.telegram.commands_enabled and not await conn.fetchval(
+        """SELECT to_regclass('telegram_default_groups') IS NOT NULL
+                  AND to_regclass('telegram_bot_offsets') IS NOT NULL"""
+      ):
+        raise RuntimeError("Telegram commands require migration 009")
       admin = auth_config.get("bootstrap_admin") or {}
       username = admin.get("username")
       password_hash = admin.get("password_hash")
@@ -1409,6 +1414,40 @@ class PostgreStore:
         msgid,
         allowed or [],
       )
+
+  async def get_telegram_default_id(self, telegram_id):
+    async with self.get_conn() as conn:
+      return await conn.fetchval(
+        "SELECT conversation_id FROM telegram_default_groups WHERE telegram_id=$1", telegram_id,
+      )
+
+  async def set_telegram_default_id(self, telegram_id, conversation_id):
+    async with self.get_conn() as conn:
+      if conversation_id is None:
+        await conn.execute("DELETE FROM telegram_default_groups WHERE telegram_id=$1", telegram_id)
+        return
+      saved = await conn.fetchval(
+        """INSERT INTO telegram_default_groups(telegram_id,conversation_id)
+           SELECT $1,id FROM conversations WHERE id=$2 AND kind='group'
+           ON CONFLICT(telegram_id) DO UPDATE
+           SET conversation_id=EXCLUDED.conversation_id, updated_at=now()
+           RETURNING conversation_id""", telegram_id, conversation_id,
+      )
+      if saved is None:
+        raise ValueError("default target must be an archived parent group")
+
+  async def get_telegram_default_group(self, principal: Principal):
+    if principal.telegram_id is None:
+      return None
+    async with self.get_conn() as conn:
+      allowed = await self._accessible_ids(conn, principal)
+      group_id = await conn.fetchval(
+        """SELECT g.group_id FROM telegram_default_groups p
+           JOIN tg_groups g ON g.conversation_id=p.conversation_id
+           WHERE p.telegram_id=$1 AND p.conversation_id=ANY($2::uuid[])""",
+        principal.telegram_id, allowed or [],
+      )
+      return str(group_id) if group_id is not None else None
 
   async def get_telegram_user(self, telegram_id):
     async with self.get_conn() as conn:

@@ -1,7 +1,10 @@
-import asyncio
 import argparse
+import asyncio
+import inspect
+import logging
 
-from .util import load_config, create_client
+from .util import create_client, load_config
+
 
 async def main():
   parser = argparse.ArgumentParser()
@@ -11,12 +14,14 @@ async def main():
   config = load_config(args.config)
   tg_config = config['telegram']
   client = create_client(tg_config)
-  await client.start(tg_config['account'])
+  started = client.start(tg_config['account'])
+  if inspect.isawaitable(started):
+    await started
   dialogs = await client.get_dialogs()
   for d in reversed(dialogs):
     print(f'{d.entity.id:10} {d.name}')
 
 if __name__ == '__main__':
   from .lib.nicelogger import enable_pretty_logging
-  enable_pretty_logging('INFO')
+  enable_pretty_logging(logging.INFO)
   asyncio.run(main())

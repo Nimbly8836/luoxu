@@ -92,6 +92,12 @@ Content-Type: application/json
 - 无身份或无可见群401；无法核验503。前端两者均静默，不宣称网络失败等同非成员。
 - 认证/个人响应不缓存。反向代理建议限制认证请求速率，并禁止记录请求体及含token的Bot API URL。
 
+## 私聊命令设置个人默认群
+
+可选开启 `[web.auth.telegram.commands].enabled=true` 后，Bot接收器会注册并处理私聊 `/default`：选择、分页、直接指定群ID或 `/default clear`。默认值按Telegram用户保存，Mini App下次打开时读取，优先于站点默认但不覆盖明确hash/start参数。列出和设置均沿用成员交集，其他人无可见群时保持静默；不更改Mini App入口或创建群授权。
+
+需新增 `009_telegram_default_groups.sql` 迁移，并保证没有其他Bot轮询器/webhook。现有webhook不会被自动删除；菜单注册范围为all_private_chats。完整操作、限制和验收见[个人默认群命令](telegram-default-command.md)。
+
 ## 升级与回滚
 
 已有数据库先备份，执行尚未应用的迁移：
@@ -101,7 +107,7 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/007_telegram_login.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/008_telegram_accounts.sql
 ```
 
-新建库 `dbsetup.sql` 已包含两表。007保存一次性启动摘要和过期时间；008保存Telegram数字ID与本站账号UUID映射。均不修改归档、公开范围或个人授权，不重导dbsetup覆盖现有库。008可重复执行。
+新建库 `dbsetup.sql` 已包含上述表及可选命令使用的偏好/游标表。007保存一次性启动摘要和过期时间；008保存Telegram数字ID与本站账号UUID映射。均不修改归档、公开范围或个人授权，不重导dbsetup覆盖现有库。008可重复执行。启用个人默认命令前还需执行 `migrations/009_telegram_default_groups.sql`；命令默认关闭时不要求009。
 
 上线建议：先部署严格静默的新前端（旧后端缺受限会话标记时它会保持空白），再备份/迁移、配置 `owner_telegram_id` 并更新后端；或在维护窗口协调切换。随后关闭并重新打开已有Mini App页面，验证主人/不同成员/非成员。旧前端仍可能回退匿名页面，不能把只更新后端或仍打开的旧页面当作已完成隐私升级。未配置owner时主人也只有公开成员交集。
 

@@ -673,6 +673,8 @@ class AuthHandler:
     if principal.telegram_id is not None:
       profile["telegram_id"] = principal.telegram_id
       profile["telegram_scope_version"] = 1
+      if self.auth.telegram.commands_enabled:
+        profile["default_group_id"] = await self.db.get_telegram_default_group(principal)
     return web.json_response({"user": profile}, headers={"Cache-Control": "private, no-store"})
 
   async def revoke_sessions(self, request):
@@ -1230,6 +1232,13 @@ def setup_app(
     app.router.add_get(rf"{prefix}/avatar/{{uid:\d+}}.jpg", ah.get)
     app.router.add_get(rf"{prefix}/avatar/{{name:\w+}}.jpg", ah.get)
     app.on_cleanup.append(ah.close)
+  if auth_service is not None and auth_service.telegram.commands_enabled is True:
+    from .telegram_commands import TelegramCommands
+
+    commands = TelegramCommands(dbconn, auth_service.telegram, client)
+    app["telegram_commands"] = commands
+    app.on_startup.append(commands.start)
+    app.on_cleanup.append(commands.close)
   return app
 
 
