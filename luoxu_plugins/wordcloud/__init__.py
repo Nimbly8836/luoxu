@@ -7,7 +7,7 @@ import subprocess
 import logging
 
 from telethon import utils
-from wordcloud import WordCloud
+from wordcloud.wordcloud import WordCloud  # type: ignore[import-not-found]
 
 logger = logging.getLogger('luoxu_plugins.wordcloud')
 
@@ -42,6 +42,8 @@ async def generate_wordcloud(chat_id, chat_title, target_user, endtime, reply):
     *cmd,
     stdout=subprocess.PIPE,
   )
+  if p.stdout is None:
+    raise RuntimeError('wordcloud subprocess stdout is unavailable')
   data = await p.stdout.read()
   lines = data.decode().splitlines()
   it = iter(lines)

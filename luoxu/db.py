@@ -99,6 +99,11 @@ class PostgreStore:
     if not auth_service:
       return
     async with self.get_conn() as conn:
+      if auth_service.telegram.enabled and not await conn.fetchval(
+        """SELECT to_regclass('auth_telegram_accounts') IS NOT NULL
+                  AND to_regclass('auth_telegram_launches') IS NOT NULL"""
+      ):
+        raise RuntimeError("Telegram login requires migrations 007 and 008")
       admin = auth_config.get("bootstrap_admin") or {}
       username = admin.get("username")
       password_hash = admin.get("password_hash")
@@ -826,7 +831,46 @@ class PostgreStore:
           msgid,
         )
 
+  async def _telegram_candidates(self, conn, owner):
+    return await conn.fetch(
+      """SELECT c.* FROM conversations c JOIN tg_groups g ON g.conversation_id=c.id
+         WHERE c.kind='group'
+           AND ($1::boolean OR EXISTS (
+             SELECT 1 FROM public_conversation_access p WHERE p.conversation_id=c.id))
+           AND (EXISTS (SELECT 1 FROM group_monitoring m
+                        WHERE m.conversation_id=c.id AND m.manual_enabled)
+                OR EXISTS (SELECT 1 FROM conversations x
+                           JOIN conversation_access a ON a.conversation_id=x.id
+                           WHERE x.kind IN ('group','topic')
+                             AND x.telegram_peer_type=c.telegram_peer_type
+                             AND x.telegram_peer_id=c.telegram_peer_id)
+                OR EXISTS (SELECT 1 FROM conversations x
+                           JOIN public_conversation_access p ON p.conversation_id=x.id
+                           WHERE x.kind IN ('group','topic')
+                             AND x.telegram_peer_type=c.telegram_peer_type
+                             AND x.telegram_peer_id=c.telegram_peer_id))
+         ORDER BY c.id""", owner,
+    )
+
+  async def telegram_group_candidates(self, owner):
+    async with self.get_conn() as conn:
+      return await self._telegram_candidates(conn, owner)
+
   async def _accessible_ids(self, conn, principal: Principal):
+    if principal.telegram_id is not None:
+      # Mini App scope precedes admin and grants. Re-read publication/monitoring
+      # during content revalidation, including after slow semantic inference.
+      candidates = await self._telegram_candidates(conn, principal.telegram_owner)
+      verified = set(principal.telegram_group_ids or ())
+      allowed = [row["id"] for row in candidates if row["id"] in verified]
+      return await conn.fetchval(
+        """SELECT coalesce(array_agg(DISTINCT c.id), '{}')
+           FROM conversations parent JOIN conversations c
+             ON c.telegram_peer_type=parent.telegram_peer_type
+            AND c.telegram_peer_id=parent.telegram_peer_id
+           WHERE parent.id=ANY($1::uuid[]) AND c.kind IN ('group','topic')""",
+        allowed,
+      )
     # HTTP principals use the current active database account, not JWT role claims.
     # Admin visibility is implicit and must not create grants/monitoring references.
     if not principal.is_anonymous and principal.is_admin:
@@ -1365,6 +1409,35 @@ class PostgreStore:
         msgid,
         allowed or [],
       )
+
+  async def get_telegram_user(self, telegram_id):
+    async with self.get_conn() as conn:
+      return await conn.fetchrow(
+        """SELECT u.* FROM auth_telegram_accounts t JOIN auth_users u ON u.id=t.user_id
+           WHERE t.telegram_id=$1""", telegram_id,
+      )
+
+  async def ensure_telegram_user(self, telegram_id):
+    async with self.get_conn() as conn:
+      # One identity across processes; never match a public Telegram username.
+      await conn.execute("SELECT pg_advisory_xact_lock($1::bigint)", 2**52 + telegram_id)
+      user = await conn.fetchrow(
+        """SELECT u.* FROM auth_telegram_accounts t JOIN auth_users u ON u.id=t.user_id
+           WHERE t.telegram_id=$1""", telegram_id,
+      )
+      if user:
+        return user
+      uid = uuid.uuid4()
+      user = await conn.fetchrow(
+        """INSERT INTO auth_users (id,username,password_hash,is_admin)
+           VALUES ($1,$2,'!telegram-only',false) RETURNING *""",
+        uid, f"tg_{telegram_id}_{uid.hex[:12]}",
+      )
+      await conn.execute(
+        "INSERT INTO auth_telegram_accounts (telegram_id,user_id) VALUES ($1,$2)",
+        telegram_id, uid,
+      )
+      return user
 
   async def get_user_by_username(self, username: str):
     async with self.get_conn() as conn:

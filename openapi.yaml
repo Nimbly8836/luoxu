@@ -4,11 +4,14 @@ info:
   version: 1.0.0
   description: >-
     Telegram message archive search, authentication, context, and
-    administration API. Active administrators implicitly read all archived
+    administration API. Web administrators implicitly read all archived
     groups, topics and private conversations without explicit grants.
     Other users retain public and individual grants. Administrator visibility
     does not publish archives or create monitoring references. Roles are read
     from the current database account on every authenticated request.
+    Telegram sessions are separately scoped: the configured owner sees joined
+    indexed groups; other Telegram users see joined indexed PUBLIC groups only.
+    Telegram sessions never inherit admin/grant access or use management APIs.
 servers:
   - url: /luoxu
 security: []
@@ -38,12 +41,16 @@ paths:
     post:
       summary: Exchange Telegram Mini App launch data for a local session
       description: >-
-        Opt-in. Requires a configured Telegram numeric ID to local account UUID
-        binding, an active local account, and membership in at least one indexed
-        group with durable monitoring references. Does not grant archive access.
-        Verifies HMAC, age and single-use launch state stored in PostgreSQL.
-        Never send init_data in URLs or logs. Sessions recheck membership
-        on authenticated requests and refresh, with a bounded membership cache.
+        Opt-in. Verifies HMAC, age and single-use launch state in PostgreSQL.
+        Each group is separately checked for current Telegram membership.
+        Owner scope is joined indexed groups; other users additionally require
+        the parent group to be public. Private chats and management APIs are
+        excluded even for a bound Web admin. Eligible unbound visitors receive
+        a Telegram-only identity with no password, admin role or grants.
+        An optional live scoped refresh token can resume an older signed launch
+        only for the same Telegram identity and current account. It is rotated.
+        Never send init_data or refresh tokens in URLs or logs. Requests and
+        refresh recheck the current scope. No eligible groups means denial.
       requestBody:
         required: true
         content:
@@ -55,6 +62,11 @@ paths:
                 init_data:
                   type: string
                   maxLength: 16384
+                  writeOnly: true
+                refresh_token:
+                  type: string
+                  writeOnly: true
+                  description: Optional scoped Telegram resume token
       responses:
         '200':
           description: Token pair with Cache-Control private, no-store
@@ -62,8 +74,8 @@ paths:
           description: Invalid JSON body
         '401':
           description: >-
-            Invalid, expired or replayed launch; inactive/unbound user;
-            not an indexed group member
+            Invalid, expired or replayed launch; inactive user; no eligible
+            joined groups; invalid resume token. Mini App stays silent.
         '503':
           description: Login disabled or membership verification unavailable
   /auth/refresh:

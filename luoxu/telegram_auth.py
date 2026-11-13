@@ -24,7 +24,7 @@ class MembershipUnavailable(Exception):
 @dataclass(frozen=True)
 class TelegramIdentity:
   telegram_id: int
-  user_id: str
+  user_id: str | None
   fingerprint: str
   expires_at: int
 
@@ -35,6 +35,11 @@ class TelegramAuth:
     if not isinstance(self.enabled, bool):
       raise ValueError("telegram.enabled must be a boolean")
     self.accounts = {}
+    self.owner_telegram_id = config.get("owner_telegram_id")
+    if self.owner_telegram_id is not None and (
+      type(self.owner_telegram_id) is not int or not 0 < self.owner_telegram_id < 2**52
+    ):
+      raise ValueError("telegram.owner_telegram_id must be a positive numeric ID")
     self.max_age = 300
     self.secret = b""
     self._token = ""
@@ -63,7 +68,7 @@ class TelegramAuth:
         raise ValueError("duplicate Telegram account binding")
       self.accounts[telegram_id] = str(uuid.UUID(account["user_id"]))
 
-  def verify(self, raw, *, now=None):
+  def verify(self, raw, *, now=None, require_fresh=True):
     if not self.enabled:
       raise ValueError("Telegram login is disabled")
     if not isinstance(raw, str) or not raw or len(raw) > 16384:
@@ -87,17 +92,16 @@ class TelegramAuth:
       raise ValueError("invalid auth_date")
     issued = int(auth_date)
     now = time.time() if now is None else now
-    if issued > now + 30 or now >= issued + self.max_age:
+    if issued > now + 30 or (require_fresh and now >= issued + self.max_age):
       raise ValueError("expired or future initData")
     try:
       user = json.loads(fields.get("user", ""))
     except (ValueError, RecursionError) as exc:
       raise ValueError("invalid user") from exc
-    if not isinstance(user, dict) or type(user.get("id")) is not int:
+    if (not isinstance(user, dict) or type(user.get("id")) is not int
+        or not 0 < user["id"] < 2**52):
       raise ValueError("invalid user id")
     user_id = self.accounts.get(user["id"])
-    if user_id is None:
-      raise ValueError("unbound Telegram user")
     # Canonical verified MAC, not the raw query: reordering/encoding cannot bypass replay checks.
     return TelegramIdentity(user["id"], user_id, hashlib.sha256(expected).hexdigest(),
                             issued + self.max_age)
@@ -181,6 +185,39 @@ class TelegramAuth:
           raise MembershipUnavailable from None
         # Only indeterminate checks fall back. A confirmed nonmember does not.
     return await self._lookup_member(session, chat_id, telegram_id)
+
+  async def visible_groups(self, db, telegram_id, client=None):
+    """Return only verified group UUIDs, never all archives after one success."""
+    owner = telegram_id == self.owner_telegram_id
+    groups = await db.telegram_group_candidates(owner)
+    allowed = []
+    failed = False
+    try:
+      async with asyncio.timeout(15), ClientSession(timeout=ClientTimeout(total=4)) as session:
+        for row in groups:
+          chat_id = (-1000000000000 - row["telegram_peer_id"]
+                     if row["telegram_peer_type"] == "channel" else -row["telegram_peer_id"])
+          key = (self.membership_source, client is not None, chat_id, telegram_id)
+          cached = self._members.get(key)
+          if cached and cached[0] > time.monotonic():
+            member = cached[1]
+          else:
+            try:
+              member = await self._check_member(session, client, chat_id, telegram_id)
+            except MembershipUnavailable:
+              failed = True
+              continue
+            self._members[key] = (time.monotonic() + self.membership_cache_ttl, member)
+            self._members.move_to_end(key)
+            while len(self._members) > 1024:
+              self._members.popitem(last=False)
+          if member:
+            allowed.append(row["id"])
+    except TimeoutError:
+      failed = True
+    if not allowed and failed:
+      raise MembershipUnavailable
+    return tuple(allowed)
 
   async def is_indexed_group_member(self, db, telegram_id, client=None):
     # Re-read monitoring intent even when Telegram results are cached: stopped

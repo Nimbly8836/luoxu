@@ -58,10 +58,15 @@ class VerificationTests(unittest.TestCase):
                signed(auth_date=str(now + 31)), signed(auth_date="NaN"),
                signed(user="null"), signed(user="[]"), signed(user="{"),
                signed(user=json.dumps({"id": True})), signed(user=json.dumps({"id": "42"})),
-               signed(user=json.dumps({"id": 999, "username": "admin", "is_admin": True}))]
+               signed(user=json.dumps({"id": -1})), signed(user=json.dumps({"id": 2**52}))]
     for value in invalid:
       with self.subTest(value_type=type(value).__name__), self.assertRaises(ValueError):
         self.auth.verify(value, now=now)
+
+  def test_unbound_signed_user_is_identity_not_authorization(self):
+    result = self.auth.verify(signed(user=json.dumps({"id": 999, "username": "admin", "is_admin": True})))
+    self.assertEqual(result.telegram_id, 999)
+    self.assertIsNone(result.user_id)
 
   def test_other_bot_rejected(self):
     raw = signed()
@@ -97,13 +102,14 @@ class TelegramHTTPTests(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self):
     with patch.dict(os.environ, {"LUOXU_TELEGRAM_BOT_TOKEN": TOKEN}):
       self.auth = AuthService({"jwt_secret": "test-secret-" * 4, "telegram": CONFIG})
-    self.member_check = AsyncMock(return_value=True)
-    self.auth.telegram.is_indexed_group_member = self.member_check
+    self.member_check = AsyncMock(return_value=(uuid.UUID(USER_ID),))
+    self.auth.telegram.visible_groups = self.member_check
     now = datetime.datetime.now(datetime.UTC)
     self.user = {"id": USER_ID, "username": "bound-account", "is_admin": False,
                  "is_active": True, "created_at": now, "updated_at": now}
     self.db = AsyncMock()
     self.db.get_user.return_value = self.user
+    self.db.get_telegram_user.return_value = None
     seen = set()
 
     async def consume(fingerprint, expires):
@@ -145,7 +151,7 @@ class TelegramHTTPTests(unittest.IsolatedAsyncioTestCase):
 
   async def test_invalid_inactive_missing_and_disabled(self):
     for body in ({}, {"init_data": "forged", "user": {"id": 42}},
-                 {"init_data": signed(user='{"id": 999}')}, {"init_data": []}):
+                 {"init_data": signed(user='{"id": -1}')}, {"init_data": []}):
       response = await self.client.post("/auth/telegram", json=body)
       self.assertEqual(response.status, 401)
     self.db.consume_telegram_init_data.assert_not_awaited()

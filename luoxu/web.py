@@ -152,20 +152,35 @@ async def cors_middleware(request, handler):
   return response
 
 
-async def _require_telegram_member(request, telegram_id, user_id):
+async def _telegram_user(auth, db, telegram_id):
+  bound = auth.accounts.get(telegram_id)
+  return await db.get_user(bound) if bound else await db.get_telegram_user(telegram_id)
+
+
+async def _telegram_scope(request, telegram_id):
   auth = request.app["auth"].telegram
   headers = {"Cache-Control": "private, no-store"}
-  if (not auth.enabled or type(telegram_id) is not int
-      or auth.accounts.get(telegram_id) != str(user_id)):
-    raise web.HTTPUnauthorized(text="invalid Telegram account binding", headers=headers)
+  if not auth.enabled or type(telegram_id) is not int or not 0 < telegram_id < 2**52:
+    raise web.HTTPUnauthorized(text="Telegram access unavailable", headers=headers)
   try:
-    allowed = await auth.is_indexed_group_member(
+    allowed = await auth.visible_groups(
       request.app["db"], telegram_id, request.app.get("telegram_client"),
     )
   except MembershipUnavailable:
-    raise web.HTTPServiceUnavailable(text="Telegram membership check unavailable", headers=headers) from None
+    raise web.HTTPServiceUnavailable(text="Telegram access unavailable", headers=headers) from None
   if not allowed:
-    raise web.HTTPUnauthorized(text="indexed group membership required", headers=headers)
+    raise web.HTTPUnauthorized(text="Telegram access unavailable", headers=headers)
+  return allowed
+
+
+async def _require_telegram_member(request, telegram_id, user_id):
+  auth = request.app["auth"].telegram
+  if not auth.enabled or type(telegram_id) is not int:
+    raise web.HTTPUnauthorized(text="Telegram access unavailable")
+  user = await _telegram_user(auth, request.app["db"], telegram_id)
+  if not user or not user["is_active"] or str(user["id"]) != str(user_id):
+    raise web.HTTPUnauthorized(text="Telegram access unavailable")
+  return await _telegram_scope(request, telegram_id)
 
 
 @web.middleware
@@ -189,8 +204,16 @@ async def auth_middleware(request, handler):
     if not user or not user["is_active"]:
       raise web.HTTPUnauthorized(text="user is inactive")
     if "telegram_id" in claims:
-      await _require_telegram_member(request, claims["telegram_id"], user["id"])
-    principal = Principal(str(user["id"]), user["username"], user["is_admin"], False)
+      if claims.get("telegram_scope_version") != 1:
+        raise web.HTTPUnauthorized(text="reopen Mini App")
+      groups = await _require_telegram_member(request, claims["telegram_id"], user["id"])
+      principal = Principal(
+        str(user["id"]), user["username"], False, False,
+        telegram_id=claims["telegram_id"], telegram_group_ids=groups,
+        telegram_owner=claims["telegram_id"] == request.app["auth"].telegram.owner_telegram_id,
+      )
+    else:
+      principal = Principal(str(user["id"]), user["username"], user["is_admin"], False)
   request["principal"] = principal
   return await handler(request)
 
@@ -581,16 +604,41 @@ class AuthHandler:
       return web.json_response({"error": "Telegram login is disabled"}, status=503, headers=headers)
     data = await _json_body(request)
     try:
-      identity = self.auth.telegram.verify(data.get("init_data"))
+      # A live refresh token may resume an old launch, but must match the signed
+      # current Telegram identity. Without it the normal launch TTL/replay rule applies.
+      identity = self.auth.telegram.verify(data.get("init_data"), require_fresh=False)
     except (ValueError, UnicodeError):
       return web.json_response({"error": "invalid Telegram login"}, status=401, headers=headers)
-    user = await self.db.get_user(identity.user_id)
-    if not user or not user["is_active"]:
+    user = await _telegram_user(self.auth.telegram, self.db, identity.telegram_id)
+    if (user and not user["is_active"]) or (identity.user_id and not user):
       return web.json_response({"error": "invalid Telegram login"}, status=401, headers=headers)
-    await _require_telegram_member(request, identity.telegram_id, user["id"])
-    expires = datetime.datetime.fromtimestamp(identity.expires_at, datetime.UTC)
-    if not await self.db.consume_telegram_init_data(identity.fingerprint, expires):
-      return web.json_response({"error": "Telegram launch already used; reopen Mini App"}, status=401, headers=headers)
+    refresh_claims = None
+    try:
+      claims = self.auth.decode(data.get("refresh_token", ""), "refresh")
+      if (user and claims.get("telegram_id") == identity.telegram_id
+          and claims.get("telegram_scope_version") == 1 and claims["sub"] == str(user["id"])):
+        refresh_claims = claims
+    except (jwt.InvalidTokenError, TypeError):
+      pass
+    if refresh_claims is None:
+      try:
+        self.auth.telegram.verify(data.get("init_data"))
+      except (ValueError, UnicodeError):
+        raise web.HTTPUnauthorized(text="Telegram access unavailable", headers=headers) from None
+    await _telegram_scope(request, identity.telegram_id)
+    if refresh_claims:
+      resumed = await self.db.consume_refresh_token(self.auth.token_fingerprint(refresh_claims["jti"]))
+      if not resumed or not resumed["is_active"] or str(resumed["id"]) != str(user["id"]):
+        raise web.HTTPUnauthorized(text="Telegram access unavailable", headers=headers)
+      user = resumed
+    else:
+      expires = datetime.datetime.fromtimestamp(identity.expires_at, datetime.UTC)
+      if not await self.db.consume_telegram_init_data(identity.fingerprint, expires):
+        raise web.HTTPUnauthorized(text="Telegram access unavailable", headers=headers)
+      if user is None:
+        user = await self.db.ensure_telegram_user(identity.telegram_id)
+      if not user["is_active"]:
+        raise web.HTTPUnauthorized(text="Telegram access unavailable", headers=headers)
     return web.json_response(await self._tokens(user, identity.telegram_id), headers=headers)
 
   async def refresh(self, request):
@@ -602,6 +650,8 @@ class AuthHandler:
       claims = self.auth.decode(raw, "refresh")
       fingerprint = self.auth.token_fingerprint(claims["jti"])
       if "telegram_id" in claims:
+        if claims.get("telegram_scope_version") != 1:
+          raise web.HTTPUnauthorized(text="reopen Mini App")
         await _require_telegram_member(request, claims["telegram_id"], claims["sub"])
       user = await self.db.consume_refresh_token(fingerprint)
     except (jwt.InvalidTokenError, KeyError, TypeError):
@@ -617,7 +667,13 @@ class AuthHandler:
     user = await self.db.get_user(principal.user_id)
     if not user or not user["is_active"]:
       raise web.HTTPUnauthorized
-    return web.json_response({"user": _user_json(user)})
+    profile = _user_json(user)
+    profile["is_admin"] = principal.is_admin
+    profile["auth_source"] = "telegram" if principal.telegram_id is not None else "web"
+    if principal.telegram_id is not None:
+      profile["telegram_id"] = principal.telegram_id
+      profile["telegram_scope_version"] = 1
+    return web.json_response({"user": profile}, headers={"Cache-Control": "private, no-store"})
 
   async def revoke_sessions(self, request):
     principal = request["principal"]

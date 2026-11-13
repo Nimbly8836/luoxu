@@ -59,6 +59,10 @@ CREATE TABLE auth_refresh_tokens (
 );
 CREATE INDEX auth_refresh_active_idx ON auth_refresh_tokens (token_hash, expires_at)
   WHERE revoked_at IS NULL;
+CREATE TABLE auth_telegram_accounts (
+  telegram_id bigint PRIMARY KEY CHECK (telegram_id > 0 AND telegram_id < 4503599627370496),
+  user_id uuid NOT NULL UNIQUE REFERENCES auth_users(id) ON DELETE CASCADE
+);
 CREATE TABLE auth_telegram_launches (
   fingerprint text PRIMARY KEY,
   expires_at timestamptz NOT NULL

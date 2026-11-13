@@ -8,7 +8,7 @@ This context defines the people, access boundaries, and Telegram content concept
 A request that has not established a user identity. An anonymous visitor is evaluated through the `pub` access role and never represents a login account.
 
 **Authenticated user**:
-A person with a Luoxu login identity. Non-administrators can access public groups plus explicitly granted conversations; private conversations require an explicit grant. Active administrators implicitly read every archived conversation.
+A person with a Luoxu login identity. In ordinary Web sessions, non-administrators can access public groups plus explicit grants and active administrators read every archive. Telegram Mini App sessions have the narrower member-intersection scope below, regardless of the linked account's role or grants.
 
 **Access role**:
 A named permission boundary used to decide which indexed groups an identity may see and search. `pub` is the access role for anonymous visitors.
@@ -26,13 +26,16 @@ A retained requirement to collect messages for a group: an independent manual se
 A retained group archive with no indexing references. Earlier messages remain stored, but the group is no longer selected for further collection.
 
 **Public group archive**:
-An archive explicitly accessible to the anonymous `pub` role and therefore to every authenticated user. This is independent of whether the Telegram group has a public username. A group requiring per-account visibility must not receive public access.
+An archive explicitly accessible to anonymous Web visitors and authenticated Web users. A Telegram Mini App visitor additionally needs current membership and active indexing references. This is independent of whether the Telegram group has a public username. A group requiring per-account visibility must not receive public access.
 
 **Administrator**:
-An active account with the current database `is_admin` role. Administrators can read all archived groups, topics and private conversations through ordinary content APIs without explicit grants, including stopped archives and future conversations. They can also manage monitoring, accounts and grants. Implicit read access does not publish data or create indexing references. Demotion or disabling takes effect on the next authenticated request; the username or a stale JWT role claim does not confer administrator access.
+An active account with the current database `is_admin` role. Through Web sessions, administrators can read all archived groups, topics and private conversations through ordinary content APIs without explicit grants, including stopped archives and future conversations. They can also manage monitoring, accounts and grants. Implicit read access does not publish data or create indexing references. Demotion or disabling takes effect on the next authenticated request; the username or a stale JWT role claim does not confer administrator access.
+
+**Telegram Mini App visitor**:
+A server-verified Telegram identity with a distinct scoped session. The configured owner can read groups they currently belong to that are actively indexed; all other visitors additionally require the parent group to be explicitly public. Topics inherit only verified parents. Telegram sessions never inherit Web admin/grant access, cannot use management APIs, and exclude private chats. Eligible unbound visitors receive a non-admin Telegram-only account without grants or a usable password. No eligible groups means silent UI, never anonymous fallback or cached group-name display. Knowing the public Web URL still permits ordinary anonymous Web access.
 
 **Private conversation**:
-An indexed one-to-one Telegram conversation. It is denied to anonymous visitors; non-administrator accounts need an explicit grant, while active administrators have implicit read access.
+An indexed one-to-one Telegram conversation. It is denied to anonymous and Mini App visitors; non-administrator Web accounts need an explicit grant, while Web administrators have implicit read access.
 
 ## Content
 

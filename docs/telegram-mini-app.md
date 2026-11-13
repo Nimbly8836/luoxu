@@ -1,117 +1,120 @@
-# Telegram Mini App 登录与配置
+# Telegram Mini App：身份、成员交集与 Web 隔离
 
-本功能默认关闭。不需要现在提供 Bot token，也不会自动部署或修改 BotFather。
+## 权限规则
 
-## 权限边界
+普通 Web 和 Mini App 是不同的会话权限，不由 Telegram 用户名、前端标记或是否显示管理按钮决定。
 
-Mini App 登录需要同时满足：
+| 入口/身份 | 内容范围 |
+| --- | --- |
+| 普通 Web 匿名 | 本站明确公开的群及话题，保持原规则 |
+| 普通 Web 普通账号 | 公开范围加个人授权，保持原规则 |
+| 普通 Web 管理员 | 全部归档，包括停用群和私聊 |
+| Mini App 主人 | **本人当前加入 ∩ 本站当前索引**的群，包括未公开群 |
+| Mini App 其他用户 | **本人当前加入 ∩ 本站当前索引 ∩ 本站明确公开**的群 |
+| Mini App 没有符合条件的群/身份无法核验 | 前端静默空白，不回退到匿名网页，不显示群名、数量或拒绝原因 |
 
-1. Telegram 官方 `initData` 验签成功，签发时间在有效期内，且本次启动数据未使用过。
-2. Telegram 数字用户 ID 已明确绑定一个现有且启用的 Luoxu 账号 UUID。
-3. 用户属于**至少一个当前正在索引的群**。
+“主人”只能通过服务器配置 `owner_telegram_id` 指定，建议设为索引账号本人的数字 ID。不是任何管理员都算主人，也不根据用户名猜测。没有配置主人时，所有 Telegram 用户都走公开群成员交集。
 
-“正在索引”以数据库持久化监听引用为准：手动监听、个人授权或公开授权使 `reference_count > 0`。不使用过时的配置 `index_groups`，不包括已停用且无引用的归档或私聊；话题引用归入父群。该状态表示索引意图，不保证采集进程当时正常运行。
+“当前索引”指持久化监听引用大于零（手动、个人授权或公开授权），不是采集进程的实时成功保证。已停用且没有引用的旧归档不在 Mini App 范围内。普通访客要求**父群显式公开**；仅公开一个话题不会把整群纳入候选。话题继承已经核验通过的父群范围。私聊不进入 Mini App。管理员全归档能力仅保留在 Web 会话。
 
-群成员资格只是 Mini App 准入门槛，**不会新增群授权、公开归档或授予管理员权限**。登录后以绑定账号的当前角色决定归档范围：**启用的管理员默认可读所有已归档群、话题和私聊，无须逐群授权**；普通账号仍按公开/个人授权。普通账号加入索引群 A 不会自动获得 A 的归档，也不会限制该账号原来对 B 的显式授权。非索引群成员资格不能作为准入依据。不按 Telegram 用户名匹配账号，不自动注册。
-
-原有匿名公开访问、网页用户名密码登录不受本门槛影响；它不是全站封闭策略，也不能阻止非群成员发现或打开 Bot，只能阻止其通过 Telegram 建立/使用本站会话。
+公开范围仍是整个 Web 的公共信息。别人直接访问普通网址/匿名 API 仍能看到公开群，这一点不因 Mini App 静默而改变，也无法靠浏览器环境标记阻止。Mini App 隔离旨在不主动向未核验的 Telegram 用户展示信息，不宣称隐藏公网已有数据。
 
 ## 后端配置
 
-先在管理界面创建所需本站账号、分配归档权限，获取其 UUID。配置示例：
-
 ```toml
 [web.auth.telegram]
-enabled = false # 准备好 token、迁移、成员核验能力后才改 true
+enabled = false # 完成007/008迁移及配置后再启用
 bot_token_env = "LUOXU_TELEGRAM_BOT_TOKEN"
+owner_telegram_id = 123456789 # 索引账号本人的数字ID，绝不是Bot ID
 max_age = 300
 membership_source = "auto"
 membership_cache_ttl = 60
 
+# 可选：保留主人与现有Web账号的关联，不扩大Mini App权限。
 [[web.auth.telegram.accounts]]
 telegram_id = 123456789
 user_id = "11111111-1111-4111-8111-111111111111"
 ```
 
-- `max_age`：启动数据有效期，30–3600 秒；最多允许未来 30 秒时钟偏差。
-- `membership_source`：`auto`（默认）、`userbot` 或 `bot`，详见下方。
-- `membership_cache_ttl`：成员查询结果缓存，0–300 秒，默认 60。设 0 可禁用缓存，但会增加 Telegram 请求。
-- `accounts` 可重复添加不同的 Telegram ID；重复 ID、非法 UUID 会在启动时报错。
-- Bot token 只放服务器环境变量，不放前端配置、URL、日志或版本库。应使用承载 Mini App 的 Bot token，与 Telethon 索引账号不同。
-- Compose 的 `core` / `web` 已预留 `LUOXU_TELEGRAM_BOT_TOKEN` 环境传递。默认关闭时可以不设置；开启后缺失/格式错误会阻止启动，避免误认为认证已经启用。
+- `max_age`：新启动数据有效期，30–3600秒，默认300；允许未来30秒时钟偏差。
+- `membership_cache_ttl`：成员核验结果缓存0–300秒，默认60。退群后的下一次请求最迟在缓存过期后拒绝；设0增加Telegram请求量。
+- `accounts`：可选现有账号绑定。绑定账号必须启用。**即使绑定Web管理员，Mini App也不是管理员，不允许管理接口，不继承个人授权或全归档能力。**
+- 其他符合条件的Telegram用户无需预建账号：仅在验签及至少一个可见群核验通过后，创建稳定的Telegram专用本站身份。随机内部用户名，不按Telegram用户名匹配；无可用密码、无管理员角色、无群授权，不增加监听引用。账号映射存储在 `auth_telegram_accounts`。管理员可禁用该身份，已有会话随即失效。
+- token只在服务器环境变量中保存。Compose预留 `LUOXU_TELEGRAM_BOT_TOKEN`，绝不提供给前端、URL或日志。启用时缺token或缺迁移直接启动失败。
 
-### 两种成员核验方式
+## Userbot 与 Bot API
 
 | `membership_source` | 行为 |
 | --- | --- |
-| `auto`（默认） | 优先复用索引进程现有的 Telethon 用户客户端；无法确认时才对该群回退 Bot API。独立 Web 无用户客户端时直接尝试 Bot API。 |
-| `userbot` | 只使用索引用户客户端；无客户端、离线、权限不足或无法解析用户时返回不可用，不尝试 Bot API。 |
-| `bot` | 只使用 Bot API `getChatMember`，保留原实现，支持独立 Web 部署。 |
+| `auto`（默认） | 每群优先使用索引器现有Telethon用户客户端，无法确认时回退Bot API |
+| `userbot` | 仅复用索引器用户客户端；需要core，不新建/重登session |
+| `bot` | 仅Bot API `getChatMember`，支持独立Web服务 |
 
-**Userbot 方式不要求 Mini App Bot 加入索引群。** 它复用 `core` 里已登录的 Telegram 用户客户端，不新建会话、不再次登录、不改变索引客户端的代理或重试设置。超级群/频道使用 `channels.getParticipant`；普通群使用 `messages.getFullChat` 的成员元数据。群成员身份仍需由 Telegram 返回确认，索引账号本人或管理员也没有免检通道。未知用户的 access hash、成员隐藏、无查询权限、掉线或限流都只能作为“无法确认”，不能据此放行。查询有超时，FloodWait 不长时间挂住认证请求。
+Userbot方式不要求Mini App Bot入群。超级群/频道使用 `channels.getParticipant`，普通群使用 `messages.getFullChat` 成员元数据。索引账号本人也必须确认成员资格，没有免检。未知access hash、隐藏成员、离线、权限不足、限流视为无法确认，不放行。Bot方式需Bot能查询对应群成员，通常需要加入并设为管理员。
 
-Bot API 方式才要求 Bot 能访问目标群，通常应加入并设为管理员，以保证能查询其他用户。`creator`、`administrator`、`member` 允许，`restricted` 仅 `is_member=true` 时允许；`left`、`kicked` 拒绝。MTProto 的离群/踢出状态同样拒绝，禁言但仍在群的成员可通过。
+确认仍在群的管理员、普通成员及禁言成员允许；已退出或踢出的用户拒绝。`auto`明确查到非成员时不会再用Bot结果覆盖拒绝。查询有单次和总时限；**只返回实际已确认的群**，其他群失败不能扩大范围；没有任何确认通过的群则拒绝。不是“任意一群通过就取得全部权限”。即使只用Userbot，Bot token仍用于Mini App启动数据验签。
 
-`auto` 中 Userbot **明确返回非成员时不对同一个群回退**，避免用另一来源覆盖明确拒绝；仍可检查其他索引群。只有无法确认（包括超时/缺权限）时回退。两种方式均无法确认时不放行。缓存按核验模式及用户客户端是否存在隔离；成员资格与原有归档授权边界不变。
+每个Telegram认证请求及refresh重新查询候选范围，并按缓存策略复核每群成员资格。发布状态、监听引用在内容权限解析时再次检查，避免慢搜索结束后使用已撤销公开范围。群列表、搜索、上下文、历史、删除快照和头像共用受限范围；管理接口始终拒绝Mini App会话。原有历史/语义功能开关仍有效。
 
-**即使使用 `userbot`，Bot token 仍然必需**：它用于验证 Mini App `initData`，与用哪个客户端查询群成员是两件事。已完成007迁移的部署切换核验模式不需要新迁移。
+## 前端静默与会话隔离
 
-Telegram 签发的 access/refresh token 保留认证来源，每个认证请求及刷新都检查当前绑定和群成员资格（允许使用有界缓存）。退出所有索引群后，最迟在成员缓存到期后的请求被拒绝；停止所有相关群的监听引用则下一次请求即不再使用这些群准入。身份绑定撤销或关闭 Telegram 登录也会拒绝已有 Telegram 会话。密码登录会话不受影响。
-
-## 数据库升级
-
-已有数据库先备份，再执行：
-
-```sh
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/007_telegram_login.sql
-```
-
-新库的 `dbsetup.sql` 已包含此表。不要重新导入 `dbsetup.sql` 覆盖已有数据库。迁移只增加一次性启动数据指纹表及过期索引，不修改归档或授权；可重复执行。新功能关闭时可先不迁移，但开启前必须完成。
-
-一次性启动防重放保存在 PostgreSQL，跨进程和重启有效。只保存验证后 MAC 的摘要及过期时间，不存原始 `initData`。成功交换后刷新页面应复用本站 refresh token。退出后重新 Telegram 登录、响应丢失或交换失败后提示“已使用”时，关闭并重新打开 Mini App 获取新的启动数据；不能复用旧启动凭据。过期记录在后续合法交换时清理。
-
-## 前端与入口（后续部署时操作）
-
-`Ken_luoxu_web/public/config.json` / 部署后的 `config.json`：
+部署 `config.json`：
 
 ```json
 {
   "apiBaseUrl": "/api/luoxu",
   "appTitle": "落絮",
-  "telegramLoginEnabled": false
+  "telegramLoginEnabled": true,
+  "defaultGroupId": ""
 }
 ```
 
-只有明确设为布尔 `true` 才会启用。普通浏览器、SDK 不可用或没有原始 `initData` 时不自动发起 Telegram 登录。Mini App 中已有本站会话优先保留；未登录时自动交换，并提供手动按钮和密码回退。
+检测到Mini App启动后，先加载SDK和配置，再将原始 `initData` 交给后端验证。只有受限Telegram身份和实时群列表确认成功后才渲染业务界面。SDK失败、空启动数据、开关关闭、登录拒绝或群列表失败都保持空白；不弹密码登录、不匿名拉取群列表、不响应未认证hash搜索。
 
-后续上线顺序：
+不复用 `luoxu_access_token`、`luoxu_refresh_token`、`luoxu_user` 等普通Web本地会话。Mini App access token仅在内存，refresh token只保存在独立sessionStorage键 `luoxu_miniapp_refresh_token`。不持久化原始initData。重新加载仍先提交当前SDK签名数据；后端只允许与该Telegram ID相符的有效受限refresh token恢复，不能拿上一个Telegram账号或Web管理员的缓存会话进入。
 
-1. 确认数据库备份和迁移，部署支持本接口的后端；保持前端开关关闭。
-2. 在服务器安全配置 token、账号绑定及核验方式。使用 `userbot`/`auto` 时确认索引客户端可查询成员；只依赖 Bot API 时将 Bot 加入所需群并设置相应权限。然后启用后端并重启对应服务。
-3. 部署 HTTPS 前端并开启前端开关；反向代理转发正确 API 前缀。若有 CSP，允许官方 SDK `https://telegram.org`；只为需要的 Telegram Web 宿主配置嵌入权限，不取消 API 鉴权。
-4. 在 BotFather 配置 Main Mini App 或菜单按钮 Web App URL 指向前端 HTTPS 地址。Telegram 内点击普通网页链接不等于 Mini App 启动。
-5. 真实客户端验收绑定成员、非成员、未绑定成员、退出群、停止监听、token 刷新、Userbot/Bot 查询不可用及密码回退。
+旧群名缓存不会预填界面，必须等待实时受限列表；默认群/启动参数也只能从该列表选取。会话失效时清除当前业务状态并静默，不循环匿名重试。Web账号存储不受影响。
 
-回滚时先关闭前端登录开关，再关闭后端 Telegram 登录，保留已有表即可。关闭后端后已有 Telegram 会话也会被拒绝，不影响密码会话。改账号权限仍按原有管理流程执行。
-
-## 接口
+## 接口与防重放
 
 ```http
 POST /api/luoxu/auth/telegram
 Content-Type: application/json
 
-{"init_data":"<SDK原始initData，仅放HTTPS请求体>"}
+{"init_data":"<SDK原始签名数据>","refresh_token":"<可选的Mini App专用刷新令牌>"}
 ```
 
-成功返回现有 `access_token`、`refresh_token`、`token_type`、`expires_in` 契约；前端接入 `configureAuthSession()` 和 `/auth/me`。401 表示启动数据无效/过期/重放、绑定无效、账号禁用或不具备索引群成员资格；503 表示功能关闭或无法确认成员资格。响应不缓存。不记录请求体或 Bot API 完整 URL；生产反向代理建议为认证接口配置适当限流。
+- 没有匹配的有效refresh token时，按HMAC、时间有效期和一次性指纹验签/交换。已使用的启动数据不能再次创建会话。
+- 有效refresh token必须属于签名数据中的同一Telegram ID、同一当前账号及新版受限会话。此时可接受该页面旧启动数据，但仍验签并轮换refresh token、核验当前成员范围。不匹配的token不能恢复旧启动数据。
+- 成功返回现有 `access_token`、`refresh_token`、`token_type`、`expires_in`。
+- `/auth/me` 为Mini App返回 `auth_source="telegram"`、`telegram_scope_version=1`、Telegram ID及 `is_admin=false`。角色和群权限仍由服务器独立检查，前端字段不是授权来源。
+- 旧Telegram token没有范围版本会被拒绝；旧Web token在普通Web仍有效。刷新和每次请求不会丢掉认证来源。
+- 无身份或无可见群401；无法核验503。前端两者均静默，不宣称网络失败等同非成员。
+- 认证/个人响应不缓存。反向代理建议限制认证请求速率，并禁止记录请求体及含token的Bot API URL。
 
-## 本地验证
+## 升级与回滚
+
+已有数据库先备份，执行尚未应用的迁移：
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/007_telegram_login.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/008_telegram_accounts.sql
+```
+
+新建库 `dbsetup.sql` 已包含两表。007保存一次性启动摘要和过期时间；008保存Telegram数字ID与本站账号UUID映射。均不修改归档、公开范围或个人授权，不重导dbsetup覆盖现有库。008可重复执行。
+
+上线建议：先部署严格静默的新前端（旧后端缺受限会话标记时它会保持空白），再备份/迁移、配置 `owner_telegram_id` 并更新后端；或在维护窗口协调切换。随后关闭并重新打开已有Mini App页面，验证主人/不同成员/非成员。旧前端仍可能回退匿名页面，不能把只更新后端或仍打开的旧页面当作已完成隐私升级。未配置owner时主人也只有公开成员交集。
+
+入口在BotFather配置Main Mini App或菜单按钮HTTPS URL。普通网页链接不等于Mini App启动。CSP按需允许 `https://telegram.org` SDK及需要的嵌入宿主，不取消鉴权。
+
+回滚到旧版本会恢复旧Mini App权限及匿名回退行为，因此**不能在继续宣称新隐私规则有效的情况下回退**。需停止Mini App入口/维护，再回退或修复；仅关闭后端登录在旧前端上可能触发匿名展示。保留新增表及身份，不倒灌归档。真实客户端验收不是合成测试的替代。
+
+## 测试
 
 ```sh
 python -m unittest discover -s tests -p 'test_telegram*.py' -v
-# PostgreSQL 防重放/迁移用可丢弃测试库，切勿填写生产库：
 LUOXU_TEST_DATABASE_URL='postgresql://…/DISPOSABLE_TEST_DB' \
   python -m unittest discover -s tests -v
 ```
 
-测试使用合成启动签名、Bot API 响应和 MTProto 客户端，不需要真实 token，不访问 Telegram。真实客户端及真实群核验须留待配置入口后验收。
+测试只使用可丢弃数据库、合成签名和模拟Telegram成员接口，不触碰生产数据。范围回归包括主人/访客/Web身份隔离、每群交集、私聊排除、话题继承、撤销公开、退群、停止监听、旧token拒绝、身份创建并发和刷新绑定当前签名身份。

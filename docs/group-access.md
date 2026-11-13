@@ -2,7 +2,9 @@
 
 监听与访问权限是两件事。管理员可先添加手动监听，再决定哪些账号能查看归档；现有的个人或公开授权也会维持所属群的采集需求，但不会扩大任何人的阅读权限。
 
-## 权限规则
+## Web 权限规则
+
+下表是普通Web会话。**Mini App单独收窄**：主人只能访问本人当前加入且正在索引的群，其他Telegram用户还要求父群明确公开；不继承下表的管理员或个人授权，不开放私聊和管理接口。无可见群时静默，知道普通网址仍能匿名访问公开内容。详见[Mini App隔离规则](telegram-mini-app.md)。
 
 | 身份 | 普通内容接口可见范围 | 管理能力 |
 | --- | --- | --- |
@@ -130,7 +132,7 @@ DELETE /api/luoxu/admin/users/<user_a_uuid>/grants/<conversation_uuid>
 POST /api/luoxu/admin/public/<conversation_uuid>
 ```
 
-成功返回 204，此后匿名及所有登录用户可访问该群。取消公开使用：
+成功返回 204，此后Web匿名及所有Web登录用户可访问该群；Mini App用户仍须通过成员交集检查。取消公开使用：
 
 ```http
 DELETE /api/luoxu/admin/public/<conversation_uuid>

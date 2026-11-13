@@ -118,9 +118,11 @@ FROM message_archives
 
 Web API 支持账号密码登录和 JWT Bearer Token。未认证请求使用匿名 `pub` 角色，只能访问数据库中明确公开的群；普通登录用户继承公开群权限，并叠加管理员授予的群或私聊会话权限。**启用的管理员默认可查看所有已归档群、话题和私聊，无须逐群授权**，停止监听的归档和以后新增的会话也包括在内。角色以数据库当前状态为准，降级或禁用对已有 token 的下一次请求生效；隐式管理员权限不会公开数据或新增监听引用。私聊必须在 `telegram.index_private_chats` 中明确配置，且不会对匿名用户公开。
 
+**Telegram Mini App 使用独立的受限会话**：配置的主人只能查看本人当前加入且正在索引的群；其他用户还必须满足父群对本站公开。符合条件的访客无需逐个建号，后端自动建立无密码/无授权的Telegram身份；没有可见群时前端静默，不回退匿名页面。Mini App不继承Web管理员或个人授权，不提供私聊和管理接口。普通网址的公开访问不变。启用前须完成007、008迁移并配置 `owner_telegram_id`，详见[Mini App配置与隔离规则](docs/telegram-mini-app.md)。
+
 在 `[web.auth]` 中配置随机 `jwt_secret`、token 有效期以及一次性的 bootstrap 管理员。管理员密码必须使用 Argon2id 哈希，不能写明文。管理员通过 `/admin/*` API 管理用户和会话授权。完整接口规范位于 `openapi.yaml`，运行后可在 `/luoxu/docs` 查看 Swagger UI。
 
-**监听不等于公开，也不等于给所有账号授权。** 管理员通过 `/admin/groups` 添加监听，通过 `/admin/users/{user_id}/grants/{conversation_id}` 按账号授权；只有加入 `/admin/public/{conversation_id}` 的群才对匿名和所有登录用户公开。需要区分 A、B 可见范围的群不要设为公开。管理列表 `/admin/conversations` 和添加响应包含 `is_public`，不要用 Telegram 用户名字段 `pub_id` 判断权限。监听由持久化的手动引用、个人授权和公开授权共同维持；删除最后一个引用才停止采集，不删除归档。`GET /admin/groups` 列出有监听需求的群，`PUT/DELETE /admin/groups/{conversation_id}` 只增减手动引用。`telegram.index_groups` 仅首次导入，之后旧配置不会覆盖后台停用状态。操作流程、状态含义和升级规则见[群组访问管理](docs/group-access.md)。
+**监听不等于公开，也不等于给所有账号授权。** 管理员通过 `/admin/groups` 添加监听，通过 `/admin/users/{user_id}/grants/{conversation_id}` 按账号授权；只有加入 `/admin/public/{conversation_id}` 的群才对匿名Web访问者和所有Web登录用户公开。需要区分 A、B 可见范围的群不要设为公开。管理列表 `/admin/conversations` 和添加响应包含 `is_public`，不要用 Telegram 用户名字段 `pub_id` 判断权限。监听由持久化的手动引用、个人授权和公开授权共同维持；删除最后一个引用才停止采集，不删除归档。`GET /admin/groups` 列出有监听需求的群，`PUT/DELETE /admin/groups/{conversation_id}` 只增减手动引用。`telegram.index_groups` 仅首次导入，之后旧配置不会覆盖后台停用状态。操作流程、状态含义和升级规则见[群组访问管理](docs/group-access.md)。
 
 消息上下文支持 `/context?g={group_id}&id={message_id}` 和 `/conversations/{conversation_id}/messages/{message_id}/context` 两种入口（都需加上配置的 Web 前缀）。`before/after` 是相邻消息；`replies` 从更早原文出发，包含后续回复和同一原文下的平行分支，原文不必命中本次搜索或处于窗口内。默认前后各 5 条、先向前最多 5 层再向后展开最多 5 层、额外讨论消息最多 100 条；可用 `before`、`after`、`depth`、`reply_limit` 缩小范围。检查新增的 `replies_meta` 判断是否截断、缺失或删除，不能把有限本地归档当作 Telegram 完整历史。两接口只查当前身份可访问的本地归档，不访问 Telegram；目标缺失或无权限返回 404。详见[消息上下文与整段讨论](docs/message-context.md)。消息编辑/删除历史由 `[web.message_history].enabled` 控制，默认关闭；单独的 `/history` 接口还需显式传 `include_history=true`。历史只从功能启用并在线捕获之后开始记录。
 

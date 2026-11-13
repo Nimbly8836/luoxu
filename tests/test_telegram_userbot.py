@@ -179,8 +179,8 @@ class UserbotMembershipTests(unittest.IsolatedAsyncioTestCase):
     db = AsyncMock()
     db.get_user.return_value = user
     db.consume_refresh_token.return_value = user
-    db.list_group_monitoring.return_value = [{"kind": "group", "telegram_peer_type": "channel",
-                                             "telegram_peer_id": 123, "reference_count": 1}]
+    db.telegram_group_candidates.return_value = [{"id": user_id, "kind": "group", "telegram_peer_type": "channel",
+                                                  "telegram_peer_id": 123}]
     self.client.return_value = types.channels.ChannelParticipant(types.ChannelParticipant(42, None), [], [])
     directory = tempfile.TemporaryDirectory()
     self.addCleanup(directory.cleanup)

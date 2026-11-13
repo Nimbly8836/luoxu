@@ -24,6 +24,9 @@ class Principal:
   username: str | None
   is_admin: bool = False
   is_anonymous: bool = True
+  telegram_id: int | None = None
+  telegram_group_ids: tuple[uuid.UUID, ...] | None = None
+  telegram_owner: bool = False
 
 
 class AuthService:
@@ -78,13 +81,14 @@ class AuthService:
     claims = {
       "sub": subject,
       "username": username,
-      "admin": is_admin,
+      "admin": is_admin if telegram_id is None else False,
       "typ": token_type,
       "iat": now,
       "exp": now + ttl,
     }
     if telegram_id is not None:
       claims["telegram_id"] = telegram_id
+      claims["telegram_scope_version"] = 1
     if jti:
       claims["jti"] = jti
     return jwt.encode(claims, self.secret, algorithm="HS256")

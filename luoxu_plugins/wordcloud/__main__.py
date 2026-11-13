@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import tempfile
 import sys
 
@@ -25,8 +26,8 @@ async def main():
 
 if __name__ == '__main__':
   try:
-    import nicelogger
-    nicelogger.enable_pretty_logging('INFO')
+    from luoxu.lib import nicelogger
+    nicelogger.enable_pretty_logging(logging.INFO)
   except ImportError:
     pass
   asyncio.run(main())
