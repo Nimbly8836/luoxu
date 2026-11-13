@@ -30,7 +30,7 @@ class TextSearchTests(deleted.DeletedSearchFixture):
   # Exercise existing real authorization/snapshot regressions through the new
   # database path, not just the unchanged legacy keyword implementation.
   test_scope_is_required_and_conflicting_archive_is_rejected = deleted.DeletedSearchTests.test_scope_is_required_and_conflicting_archive_is_rejected
-  test_grants_and_revocation = deleted.DeletedSearchTests.test_public_personal_grants_admin_non_bypass_and_immediate_revocation
+  test_grants_and_revocation = deleted.DeletedSearchTests.test_public_personal_grants_admin_all_access_and_immediate_revocation
   test_topic_grants = deleted.DeletedSearchTests.test_topic_only_grant_does_not_expose_parent_or_sibling_snapshots
   test_private_grants = deleted.DeletedSearchTests.test_private_chat_snapshots_require_an_individual_grant
   test_sender_filters = deleted.DeletedSearchTests.test_sender_group_conversation_and_time_filters_apply_before_limit

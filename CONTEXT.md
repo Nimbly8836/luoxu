@@ -8,7 +8,7 @@ This context defines the people, access boundaries, and Telegram content concept
 A request that has not established a user identity. An anonymous visitor is evaluated through the `pub` access role and never represents a login account.
 
 **Authenticated user**:
-A person with a Luoxu login identity. Their access includes groups available to the `pub` role plus groups explicitly granted to that identity; private conversations still require an explicit grant.
+A person with a Luoxu login identity. Non-administrators can access public groups plus explicitly granted conversations; private conversations require an explicit grant. Active administrators implicitly read every archived conversation.
 
 **Access role**:
 A named permission boundary used to decide which indexed groups an identity may see and search. `pub` is the access role for anonymous visitors.
@@ -29,10 +29,10 @@ A retained group archive with no indexing references. Earlier messages remain st
 An archive explicitly accessible to the anonymous `pub` role and therefore to every authenticated user. This is independent of whether the Telegram group has a public username. A group requiring per-account visibility must not receive public access.
 
 **Administrator**:
-An account allowed to enumerate all archived conversations, start monitoring, and manage accounts and grants through administration APIs. Administrative management authority does not bypass grants in ordinary content APIs; administrators can explicitly grant their own accounts access.
+An active account with the current database `is_admin` role. Administrators can read all archived groups, topics and private conversations through ordinary content APIs without explicit grants, including stopped archives and future conversations. They can also manage monitoring, accounts and grants. Implicit read access does not publish data or create indexing references. Demotion or disabling takes effect on the next authenticated request; the username or a stale JWT role claim does not confer administrator access.
 
 **Private conversation**:
-An indexed one-to-one Telegram conversation. It is not an accessible group and is denied to anonymous visitors by definition; a named user needs an explicit grant for the conversation.
+An indexed one-to-one Telegram conversation. It is denied to anonymous visitors; non-administrator accounts need an explicit grant, while active administrators have implicit read access.
 
 ## Content
 

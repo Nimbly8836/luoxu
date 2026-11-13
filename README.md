@@ -116,7 +116,7 @@ FROM message_archives
 认证、权限与 API
 ====
 
-Web API 支持账号密码登录和 JWT Bearer Token。未认证请求使用匿名 `pub` 角色，只能访问数据库中明确公开的群；登录用户继承公开群权限，并叠加管理员授予的群或私聊会话权限。私聊必须在 `telegram.index_private_chats` 中明确配置，且不会对匿名用户公开。
+Web API 支持账号密码登录和 JWT Bearer Token。未认证请求使用匿名 `pub` 角色，只能访问数据库中明确公开的群；普通登录用户继承公开群权限，并叠加管理员授予的群或私聊会话权限。**启用的管理员默认可查看所有已归档群、话题和私聊，无须逐群授权**，停止监听的归档和以后新增的会话也包括在内。角色以数据库当前状态为准，降级或禁用对已有 token 的下一次请求生效；隐式管理员权限不会公开数据或新增监听引用。私聊必须在 `telegram.index_private_chats` 中明确配置，且不会对匿名用户公开。
 
 在 `[web.auth]` 中配置随机 `jwt_secret`、token 有效期以及一次性的 bootstrap 管理员。管理员密码必须使用 Argon2id 哈希，不能写明文。管理员通过 `/admin/*` API 管理用户和会话授权。完整接口规范位于 `openapi.yaml`，运行后可在 `/luoxu/docs` 查看 Swagger UI。
 

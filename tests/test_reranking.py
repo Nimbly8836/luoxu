@@ -323,9 +323,9 @@ class RerankingDatabaseTests(semantic_tests.SemanticDatabaseFixture):
     from luoxu.auth import Principal
     await self.seed(1, "job private", cid=self.private)
     await self.backfill()
-    user = await self.db.create_user("rerank-reader", "unused", True)
+    user = await self.db.create_user("rerank-reader", "unused", False)
     await self.db.grant_conversation(user["id"], self.private)
-    principal = Principal(str(user["id"]), "rerank-reader", True, False)
+    principal = Principal(str(user["id"]), "rerank-reader", False, False)
     q = SearchQuery(0, "job", None, None, None, conversation_id=str(self.private), mode="semantic")
     _, rows = await self.db.search(q, principal)
     self.assertEqual([r["text"] for r in rows], ["job private"])

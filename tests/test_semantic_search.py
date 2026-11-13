@@ -278,8 +278,8 @@ class SemanticDatabaseTests(SemanticDatabaseFixture):
     await self.backfill()
     rows = await self.search()
     self.assertEqual([r["msgid"] for r in rows], [1, 2])
-    self.assertAlmostEqual(rows[0]["score"], 1)
-    self.assertAlmostEqual(rows[1]["score"], 0)
+    self.assertAlmostEqual(float(rows[0]["score"]), 1)
+    self.assertAlmostEqual(float(rows[1]["score"]), 0)
     q = SearchQuery(123, "food", None, None, None)
     _, rows = await self.db.search(q, ANON)
     self.assertEqual([r["msgid"] for r in rows], [2])
@@ -300,8 +300,11 @@ class SemanticDatabaseTests(SemanticDatabaseFixture):
     q = SearchQuery(123, "job", None, None, None, mode="semantic")
     _, rows = await self.db.search(q, principal)
     self.assertEqual({r["msgid"] for r in rows}, {1, 3})
-    await self.db.grant_conversation(admin["id"], self.private)
     private_query = q._replace(group=0, conversation_id=str(self.private))
+    # Admins can read private archives before any explicit grant.
+    _, rows = await self.db.search(private_query, principal)
+    self.assertEqual({r["msgid"] for r in rows}, {2})
+    await self.db.grant_conversation(admin["id"], self.private)
     _, rows = await self.db.search(private_query, principal)
     self.assertEqual({r["msgid"] for r in rows}, {2})
     _, rows = await self.db.search(q, principal)
@@ -310,10 +313,18 @@ class SemanticDatabaseTests(SemanticDatabaseFixture):
     await self.db.revoke_public(self.public)
     with self.assertRaises(GroupNotFound):
       await self.search()
+    _, rows = await self.db.search(q, principal)
+    self.assertEqual({r["msgid"] for r in rows}, {1, 3})
+    _, rows = await self.db.search(private_query, principal)
+    self.assertEqual({r["msgid"] for r in rows}, {2})
+    reader = await self.db.create_user("ordinary-reader", "unused", False)
+    restricted = Principal(str(reader["id"]), "ordinary-reader", False, False)
+    await self.db.grant_conversation(reader["id"], self.private)
+    _, rows = await self.db.search(private_query, restricted)
+    self.assertEqual({r["msgid"] for r in rows}, {2})
+    await self.db.revoke_conversation(reader["id"], self.private)
     with self.assertRaises(GroupNotFound):
-      await self.db.search(q, principal)
-    with self.assertRaises(GroupNotFound):
-      await self.db.search(private_query, principal)
+      await self.db.search(private_query, restricted)
 
   async def test_sender_exclusions_dates_and_group_filter_before_limit(self):
     await self.seed(1, sender=100, year=2020)
@@ -335,7 +346,7 @@ class SemanticDatabaseTests(SemanticDatabaseFixture):
       self.assertEqual(await conn.fetchval(f"SELECT count(*) FROM {self.embeddings}"), 0)
     self.assertEqual(await self.search(), [])
     await self.backfill()
-    self.assertAlmostEqual((await self.search())[0]["score"], 0)
+    self.assertAlmostEqual(float((await self.search())[0]["score"]), 0)
     await self.db.delete_messages(123, [1], peer_type="channel")
     async with self.db.get_conn() as conn:
       self.assertEqual(await conn.fetchval(f"SELECT count(*) FROM {self.embeddings}"), 0)
@@ -382,7 +393,7 @@ class SemanticDatabaseTests(SemanticDatabaseFixture):
       self.assertEqual(await conn.fetchval(f"SELECT count(*) FROM {self.embeddings}"), 0)
     self.embedder.before_return = None
     await self.backfill()
-    self.assertAlmostEqual((await self.search())[0]["score"], 0)
+    self.assertAlmostEqual(float((await self.search())[0]["score"]), 0)
 
   async def test_disabled_outage_and_missing_migration_are_503_not_fallback(self):
     await self.seed(1)

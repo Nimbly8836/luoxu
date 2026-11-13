@@ -827,6 +827,10 @@ class PostgreStore:
         )
 
   async def _accessible_ids(self, conn, principal: Principal):
+    # HTTP principals use the current active database account, not JWT role claims.
+    # Admin visibility is implicit and must not create grants/monitoring references.
+    if not principal.is_anonymous and principal.is_admin:
+      return await conn.fetchval("SELECT coalesce(array_agg(id), '{}') FROM conversations")
     if principal.is_anonymous:
       return await conn.fetchval("""
         SELECT coalesce(array_agg(DISTINCT id), '{}') FROM (

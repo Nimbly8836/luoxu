@@ -185,7 +185,7 @@ class DeletedSearchTests(DeletedSearchFixture):
     _, body = await self.search({"include_deleted": "true", "q": "needle"})
     self.assertEqual(body["messages"], [])
 
-  async def test_public_personal_grants_admin_non_bypass_and_immediate_revocation(self):
+  async def test_public_personal_grants_admin_all_access_and_immediate_revocation(self):
     alice, alice_headers = await self.user("alice")
     bob, bob_headers = await self.user("bob")
     _, admin_headers = await self.user("administrator", admin=True)
@@ -208,7 +208,7 @@ class DeletedSearchTests(DeletedSearchFixture):
       (None, {str(self.cid)}),
       (alice_headers, {str(self.cid), str(private[0])}),
       (bob_headers, {str(self.cid), str(private[1])}),
-      (admin_headers, {str(self.cid)}),
+      (admin_headers, {str(self.cid), *(str(cid) for cid in private)}),
     ):
       # Search every target explicitly; no cross-group content query is allowed.
       for cid in (self.cid, *private):
@@ -219,7 +219,7 @@ class DeletedSearchTests(DeletedSearchFixture):
           self.assertTrue(all(r["deleted"] for r in body["messages"]))
         else:
           await self.assert_denied(scoped, headers=headers)
-    for headers in (None, bob_headers, admin_headers):
+    for headers in (None, bob_headers):
       response = await self.client.get(
         PREFIX + "/search",
         params={**query, "g": fixtures.GROUP_ID + 1},
@@ -233,8 +233,10 @@ class DeletedSearchTests(DeletedSearchFixture):
     _, body = await self.search(query, headers=alice_headers)
     self.assertEqual({r["conversation_id"] for r in body["messages"]}, {str(self.cid)})
     await self.db.revoke_public(self.cid)
-    for headers in (None, alice_headers, admin_headers):
+    for headers in (None, alice_headers):
       await self.assert_denied({**query, "g": fixtures.GROUP_ID}, headers=headers)
+    _, body = await self.search({**query, "g": fixtures.GROUP_ID}, headers=admin_headers)
+    self.assertEqual({r["conversation_id"] for r in body["messages"]}, {str(self.cid)})
 
   async def test_topic_only_grant_does_not_expose_parent_or_sibling_snapshots(self):
     await self.db.revoke_public(self.cid)
@@ -280,8 +282,10 @@ class DeletedSearchTests(DeletedSearchFixture):
       )
     await self.db.delete_messages(777, [1], kind="private_chat", peer_type="user")
     query = {"include_deleted": "true", "q": "needle", "conversation_id": str(cid)}
-    for identity in (None, headers, admin_headers):
+    for identity in (None, headers):
       await self.assert_denied(query, headers=identity)
+    _, admin_body = await self.search(query, headers=admin_headers)
+    self.assertEqual([r["conversation_id"] for r in admin_body["messages"]], [str(cid)])
     await self.db.grant_conversation(user["id"], cid)
     _, body = await self.search(query, headers=headers)
     self.assertEqual([r["conversation_id"] for r in body["messages"]], [str(cid)])

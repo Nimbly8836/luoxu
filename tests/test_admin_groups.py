@@ -62,7 +62,7 @@ class AdminGroupFixture(unittest.IsolatedAsyncioTestCase):
       id=GROUP_ID,
       title="Monitored private group",
       photo=types.ChatPhotoEmpty(),
-      date=datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc),
+      date=datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC),
       megagroup=True,
     )
     self.telegram = create_autospec(TelegramClient, instance=True)
@@ -157,7 +157,7 @@ class AdminGroupFixture(unittest.IsolatedAsyncioTestCase):
         group_id,
         sender_id,
         f"sender {sender_id}",
-        datetime.datetime(2025, 1, 2, tzinfo=datetime.timezone.utc),
+        datetime.datetime(2025, 1, 2, tzinfo=datetime.UTC),
       )
     return {"cid": cid, "group_id": group_id, "sender_id": sender_id}
 
@@ -218,6 +218,99 @@ class AdminGroupFixture(unittest.IsolatedAsyncioTestCase):
 
 
 class AdminGroupTests(AdminGroupFixture):
+  async def test_admin_role_changes_apply_to_old_tokens_without_grants(self):
+    uid, ordinary_token = await self.login_user("future-admin")
+    groups = [await self.seed_group_message(GROUP_ID, 800000)]
+    allowed = {groups[0]["cid"]}
+    await self.assert_content_access(ordinary_token, groups, set())
+    response = await self.client.patch(
+      PREFIX + f"/admin/users/{uid}", json={"is_admin": True}, headers=self.headers,
+    )
+    self.assertEqual(response.status, 200)
+    # Even the old token whose admin claim is false gains the current DB role.
+    await self.assert_content_access(ordinary_token, groups, allowed)
+    admin_user = await self.db.get_user(uid)
+    admin_token = {"Authorization": "Bearer " + self.auth.access_token(admin_user)}
+    await self.assert_content_access(admin_token, groups, allowed)
+    self.assertEqual(await self.db.list_user_grants(uid), [])
+    monitoring = await self.db.list_group_monitoring()
+    self.assertEqual(monitoring[0]["reference_count"], 1)
+    response = await self.client.patch(
+      PREFIX + f"/admin/users/{uid}", json={"is_admin": False}, headers=self.headers,
+    )
+    self.assertEqual(response.status, 200)
+    # Cached avatars and an old admin=true JWT must not survive demotion.
+    await self.assert_content_access(admin_token, groups, set())
+    await self.db.update_user(uid, is_admin=True, is_active=False)
+    response = await self.client.get(PREFIX + "/groups", headers=admin_token)
+    self.assertEqual(response.status, 401)
+
+  async def test_admin_reads_stopped_and_future_archives_without_monitoring_refs(self):
+    groups = [await self.seed_group_message(GROUP_ID, 800000)]
+    cid = groups[0]["cid"]
+    response = await self.client.delete(PREFIX + f"/admin/groups/{cid}", headers=self.headers)
+    self.assertEqual(response.status, 204)
+    groups.append(await self.seed_group_message(GROUP_ID + 1, 800001))
+    await self.assert_content_access(self.headers, groups, {g["cid"] for g in groups})
+    await self.assert_content_access({}, groups, set())
+    self.assertEqual(await self.db.list_user_grants(self.admin_user["id"]), [])
+    refs = {str(row["id"]): row["reference_count"] for row in await self.db.list_group_monitoring()}
+    self.assertEqual(refs[cid], 0)
+    self.assertEqual(refs[groups[1]["cid"]], 1)
+
+  async def test_admin_reads_ungranted_topics_private_chats_and_history(self):
+    _, ordinary = await self.login_user("restricted-reader")
+    parent = await self.seed_group_message(GROUP_ID, 800000)
+    async with self.db.get_conn() as conn:
+      topic = await self.db._ensure_conversation(
+        conn, "topic", "channel", GROUP_ID, "Unpublished topic", topic_id=123,
+        legacy_group_id=GROUP_ID,
+      )
+      private = await self.db._ensure_conversation(
+        conn, "private_chat", "user", 654321, "Unpublished private archive",
+      )
+      for row in (topic, private):
+        archive = await self.db.archive_conn(conn, row["id"])
+        # Fixed archive template; values are bound parameters.
+        # pi-lens-ignore: python-sql-injection
+        await archive.execute(
+          """INSERT INTO {messages}
+             (conversation_id, msgid, text, from_user, from_user_name, created_at)
+             VALUES ($1, 7, 'private visibility marker', 654321, 'test sender', now())""",
+          row["id"],
+        )
+        await conn.execute(
+          """INSERT INTO message_revisions
+             (conversation_id, msgid, revision_type, text, from_user_name, created_at)
+             VALUES ($1, 7, 'edit', 'original private text', 'test sender', now())""",
+          row["id"],
+        )
+    directory = tempfile.TemporaryDirectory()
+    self.addCleanup(directory.cleanup)
+    app = setup_app(self.db, None, directory.name, "nobody.jpg", "ghost.jpg",
+                    prefix=PREFIX, auth_service=self.auth, history_enabled=True)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    self.addAsyncCleanup(client.close)
+    all_ids = {parent["cid"], str(topic["id"]), str(private["id"])}
+    for headers, expected in ((self.headers, all_ids), (ordinary, set()), ({}, set())):
+      response = await client.get(PREFIX + "/conversations", headers=headers)
+      self.assertEqual({r["id"] for r in (await response.json())["conversations"]}, expected)
+      for row in (topic, private):
+        cid = str(row["id"])
+        status = 200 if cid in expected else 404
+        for path in (f"/conversations/{cid}/messages/7",
+                     f"/conversations/{cid}/messages/7/context",
+                     f"/conversations/{cid}/messages/7/history?include_history=true",
+                     f"/search?conversation_id={cid}&q=visibility"):
+          response = await client.get(PREFIX + path, headers=headers)
+          self.assertEqual(response.status, status, path)
+          if status == 200 and "/history?" in path:
+            self.assertEqual(len((await response.json())["history"]), 1)
+    # Implicit admin reads do not make anything public or create explicit grants.
+    self.assertEqual(await self.db.list_public_grants(), [])
+    self.assertEqual(await self.db.list_user_grants(self.admin_user["id"]), [])
+
   async def test_two_logins_have_independent_grants_and_revocation_is_immediate(self):
     alice_id, alice = await self.login_user("alice")
     bob_id, bob = await self.login_user("bob")
@@ -236,15 +329,16 @@ class AdminGroupTests(AdminGroupFixture):
     await self.assert_content_access(alice, groups, {private_a, public})
     await self.assert_content_access(bob, groups, {private_b, public})
     await self.assert_content_access({}, groups, {public})
-    # Management authority is not an implicit bypass of content permissions.
-    await self.assert_content_access(self.headers, groups, {public})
+    # Admins implicitly read every archive without per-conversation grants.
+    all_ids = {private_a, private_b, public}
+    await self.assert_content_access(self.headers, groups, all_ids)
     admin_grant = PREFIX + f"/admin/users/{self.admin_user['id']}/grants/{private_a}"
     response = await self.client.put(admin_grant, headers=self.headers)
     self.assertEqual(response.status, 204)
-    await self.assert_content_access(self.headers, groups, {private_a, public})
+    await self.assert_content_access(self.headers, groups, all_ids)
     response = await self.client.delete(admin_grant, headers=self.headers)
     self.assertEqual(response.status, 204)
-    await self.assert_content_access(self.headers, groups, {public})
+    await self.assert_content_access(self.headers, groups, all_ids)
     response = await self.client.get(
       PREFIX + "/admin/conversations", headers=self.headers
     )
@@ -275,7 +369,7 @@ class AdminGroupTests(AdminGroupFixture):
     await self.assert_content_access(alice, groups, set())
     await self.assert_content_access(bob, groups, {private_b})
     await self.assert_content_access({}, groups, set())
-    await self.assert_content_access(self.headers, groups, set())
+    await self.assert_content_access(self.headers, groups, all_ids)
     self.assertEqual(len(await self.db.list_all_conversations()), 3)
 
   async def test_only_admin_can_monitor_or_change_account_grants(self):

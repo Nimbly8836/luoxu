@@ -4,7 +4,11 @@ info:
   version: 1.0.0
   description: >-
     Telegram message archive search, authentication, context, and
-    administration API.
+    administration API. Active administrators implicitly read all archived
+    groups, topics and private conversations without explicit grants.
+    Other users retain public and individual grants. Administrator visibility
+    does not publish archives or create monitoring references. Roles are read
+    from the current database account on every authenticated request.
 servers:
   - url: /luoxu
 security: []

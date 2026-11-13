@@ -810,9 +810,14 @@ class TopicStorageTests(unittest.IsolatedAsyncioTestCase):
     ]
     async with self.api_client(auth) as client:
       for path in paths:
-        for denied_headers in ({}, admin_headers):
-          response = await client.get(path, headers=denied_headers)
-          self.assertEqual(response.status, 404)
+        response = await client.get(path)
+        self.assertEqual(response.status, 404)
+        response = await client.get(path, headers=admin_headers)
+        self.assertEqual(response.status, 200)
+        admin_body = await response.json()
+        self.assertEqual({m["id"] for m in admin_body["replies"]}, {1, 20, 30, 40, 50, 60})
+        # Admin scope spans all archives, but threads still cannot cross peers.
+        self.assertNotIn("PRIVATE-NOT", str(admin_body))
         response = await client.get(path, headers=headers)
         self.assertEqual(response.status, 200)
         body = await response.json()
