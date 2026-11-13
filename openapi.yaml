@@ -30,6 +30,38 @@ paths:
           description: Access and refresh tokens
         '401':
           description: Invalid credentials
+  /auth/telegram:
+    post:
+      summary: Exchange Telegram Mini App launch data for a local session
+      description: >-
+        Opt-in. Requires a configured Telegram numeric ID to local account UUID
+        binding, an active local account, and membership in at least one indexed
+        group with durable monitoring references. Does not grant archive access.
+        Verifies HMAC, age and single-use launch state stored in PostgreSQL.
+        Never send init_data in URLs or logs. Sessions recheck membership
+        on authenticated requests and refresh, with a bounded membership cache.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [init_data]
+              properties:
+                init_data:
+                  type: string
+                  maxLength: 16384
+      responses:
+        '200':
+          description: Token pair with Cache-Control private, no-store
+        '400':
+          description: Invalid JSON body
+        '401':
+          description: >-
+            Invalid, expired or replayed launch; inactive/unbound user;
+            not an indexed group member
+        '503':
+          description: Login disabled or membership verification unavailable
   /auth/refresh:
     post:
       summary: Rotate a refresh token

@@ -1511,6 +1511,17 @@ class PostgreStore:
         conversation_id,
       )
 
+  async def consume_telegram_init_data(self, fingerprint, expires_at):
+    # Shared PostgreSQL state makes replay protection work across workers/restarts.
+    async with self.get_conn() as conn:
+      await conn.execute("DELETE FROM auth_telegram_launches WHERE expires_at <= now()")
+      return bool(await conn.fetchval(
+        """INSERT INTO auth_telegram_launches (fingerprint, expires_at)
+           SELECT $1, $2 WHERE $2 > now()
+           ON CONFLICT DO NOTHING RETURNING true""",
+        fingerprint, expires_at,
+      ))
+
   async def save_refresh_token(self, user_id, token_hash, expires_at):
     async with self.get_conn() as conn:
       await conn.execute(

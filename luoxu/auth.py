@@ -15,6 +15,8 @@ from argon2.exceptions import (  # type: ignore[import-not-found]
   VerifyMismatchError,
 )
 
+from .telegram_auth import TelegramAuth
+
 
 @dataclass(frozen=True)
 class Principal:
@@ -34,6 +36,7 @@ class AuthService:
     if self.access_ttl >= self.refresh_ttl:
       raise ValueError("access token TTL must be shorter than refresh token TTL")
     self.hasher = PasswordHasher()
+    self.telegram = TelegramAuth(config.get("telegram", {}))
 
   @staticmethod
   def _positive_int(value: Any, default: int) -> int:
@@ -66,6 +69,7 @@ class AuthService:
     token_type: str,
     ttl: int,
     jti: str | None = None,
+    telegram_id: int | None = None,
   ) -> str:
     try:
       now = int(time.time())
@@ -79,16 +83,19 @@ class AuthService:
       "iat": now,
       "exp": now + ttl,
     }
+    if telegram_id is not None:
+      claims["telegram_id"] = telegram_id
     if jti:
       claims["jti"] = jti
     return jwt.encode(claims, self.secret, algorithm="HS256")
 
-  def access_token(self, user: dict[str, Any]) -> str:
+  def access_token(self, user: dict[str, Any], telegram_id: int | None = None) -> str:
     return self._encode(
-      str(user["id"]), user["username"], user["is_admin"], "access", self.access_ttl
+      str(user["id"]), user["username"], user["is_admin"], "access", self.access_ttl,
+      telegram_id=telegram_id,
     )
 
-  def refresh_token(self, user: dict[str, Any]) -> tuple[str, str, int]:
+  def refresh_token(self, user: dict[str, Any], telegram_id: int | None = None) -> tuple[str, str, int]:
     jti = str(uuid.uuid4())
     return (
       self._encode(
@@ -98,6 +105,7 @@ class AuthService:
         "refresh",
         self.refresh_ttl,
         jti,
+        telegram_id,
       ),
       jti,
       self.refresh_ttl,

@@ -59,6 +59,11 @@ CREATE TABLE auth_refresh_tokens (
 );
 CREATE INDEX auth_refresh_active_idx ON auth_refresh_tokens (token_hash, expires_at)
   WHERE revoked_at IS NULL;
+CREATE TABLE auth_telegram_launches (
+  fingerprint text PRIMARY KEY,
+  expires_at timestamptz NOT NULL
+);
+CREATE INDEX auth_telegram_launches_expiry_idx ON auth_telegram_launches (expires_at);
 CREATE TABLE conversation_access (
   user_id uuid NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
   conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,

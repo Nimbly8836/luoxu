@@ -24,6 +24,7 @@ from .auth import AuthService, Principal  # type: ignore[import-not-found]
 from .group import MonitoringUnavailable
 from .semantic import MAX_OFFSET, MAX_QUERY_CHARS, SemanticUnavailable
 from .rerank import valid_score
+from .telegram_auth import MembershipUnavailable
 from .types import GroupNotFound, SearchQuery
 from .text_search import advanced_text_search, validate_text_options
 
@@ -151,6 +152,20 @@ async def cors_middleware(request, handler):
   return response
 
 
+async def _require_telegram_member(request, telegram_id, user_id):
+  auth = request.app["auth"].telegram
+  headers = {"Cache-Control": "private, no-store"}
+  if (not auth.enabled or type(telegram_id) is not int
+      or auth.accounts.get(telegram_id) != str(user_id)):
+    raise web.HTTPUnauthorized(text="invalid Telegram account binding", headers=headers)
+  try:
+    allowed = await auth.is_indexed_group_member(request.app["db"], telegram_id)
+  except MembershipUnavailable:
+    raise web.HTTPServiceUnavailable(text="Telegram membership check unavailable", headers=headers) from None
+  if not allowed:
+    raise web.HTTPUnauthorized(text="indexed group membership required", headers=headers)
+
+
 @web.middleware
 async def auth_middleware(request, handler):
   token = request.headers.get("Authorization", "")
@@ -171,6 +186,8 @@ async def auth_middleware(request, handler):
       raise web.HTTPUnauthorized(text="invalid access token") from exc
     if not user or not user["is_active"]:
       raise web.HTTPUnauthorized(text="user is inactive")
+    if "telegram_id" in claims:
+      await _require_telegram_member(request, claims["telegram_id"], user["id"])
     principal = Principal(str(user["id"]), user["username"], user["is_admin"], False)
   request["principal"] = principal
   return await handler(request)
@@ -556,19 +573,40 @@ class AuthHandler:
       raise web.HTTPUnauthorized(text="invalid username or password")
     return web.json_response(await self._tokens(user))
 
+  async def telegram(self, request):
+    headers = {"Cache-Control": "private, no-store"}
+    if self.auth is None or not self.auth.telegram.enabled:
+      return web.json_response({"error": "Telegram login is disabled"}, status=503, headers=headers)
+    data = await _json_body(request)
+    try:
+      identity = self.auth.telegram.verify(data.get("init_data"))
+    except (ValueError, UnicodeError):
+      return web.json_response({"error": "invalid Telegram login"}, status=401, headers=headers)
+    user = await self.db.get_user(identity.user_id)
+    if not user or not user["is_active"]:
+      return web.json_response({"error": "invalid Telegram login"}, status=401, headers=headers)
+    await _require_telegram_member(request, identity.telegram_id, user["id"])
+    expires = datetime.datetime.fromtimestamp(identity.expires_at, datetime.UTC)
+    if not await self.db.consume_telegram_init_data(identity.fingerprint, expires):
+      return web.json_response({"error": "Telegram launch already used; reopen Mini App"}, status=401, headers=headers)
+    return web.json_response(await self._tokens(user, identity.telegram_id), headers=headers)
+
   async def refresh(self, request):
     data = await _json_body(request)
     raw = str(data.get("refresh_token", ""))
     fingerprint = None
+    claims = {}
     try:
       claims = self.auth.decode(raw, "refresh")
       fingerprint = self.auth.token_fingerprint(claims["jti"])
+      if "telegram_id" in claims:
+        await _require_telegram_member(request, claims["telegram_id"], claims["sub"])
       user = await self.db.consume_refresh_token(fingerprint)
     except (jwt.InvalidTokenError, KeyError, TypeError):
       user = None
     if not user or not user["is_active"] or not fingerprint:
       raise web.HTTPUnauthorized(text="invalid refresh token")
-    return web.json_response(await self._tokens(user))
+    return web.json_response(await self._tokens(user, claims.get("telegram_id")))
 
   async def me(self, request):
     principal = request["principal"]
@@ -586,9 +624,9 @@ class AuthHandler:
     await self.db.revoke_user_sessions(principal.user_id)
     return web.Response(status=204)
 
-  async def _tokens(self, user):
-    access = self.auth.access_token(user)
-    refresh, jti, ttl = self.auth.refresh_token(user)
+  async def _tokens(self, user, telegram_id=None):
+    access = self.auth.access_token(user, telegram_id)
+    refresh, jti, ttl = self.auth.refresh_token(user, telegram_id)
     expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
       seconds=ttl
     )
@@ -1083,6 +1121,7 @@ def setup_app(
   )
   auth = AuthHandler(dbconn, auth_service)
   app.router.add_post(f"{prefix}/auth/login", auth.login)
+  app.router.add_post(f"{prefix}/auth/telegram", auth.telegram)
   app.router.add_post(f"{prefix}/auth/refresh", auth.refresh)
   app.router.add_get(f"{prefix}/auth/me", auth.me)
   app.router.add_post(f"{prefix}/auth/sessions/revoke", auth.revoke_sessions)

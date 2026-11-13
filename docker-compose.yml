@@ -29,6 +29,8 @@ services:
         PIP_RETRIES: ${LUOXU_PIP_RETRIES:-5}
     image: ${LUOXU_IMAGE:-ghcr.io/nimbly8836/luoxu:latest}
     profiles: [core]
+    environment:
+      LUOXU_TELEGRAM_BOT_TOKEN: ${LUOXU_TELEGRAM_BOT_TOKEN:-}
     depends_on:
       db:
         condition: service_healthy
@@ -47,6 +49,8 @@ services:
       args: *luoxu-build-args
     image: ${LUOXU_IMAGE:-ghcr.io/nimbly8836/luoxu:latest}
     profiles: [web]
+    environment:
+      LUOXU_TELEGRAM_BOT_TOKEN: ${LUOXU_TELEGRAM_BOT_TOKEN:-}
     depends_on:
       db:
         condition: service_healthy
