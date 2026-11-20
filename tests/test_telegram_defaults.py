@@ -192,6 +192,51 @@ class TelegramDefaultTests(AdminGroupFixture):
     self.assertEqual(resumed_api.sent, [])
     await restarted.close(None)
 
+  async def test_conflict_cooldown_retains_lease_and_then_resumes_processing(self):
+    store = await self.polling_store()
+    reached, cooling, resume = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    api = self.polling_api(reached)
+    original_call = api.call.side_effect
+    first = True
+
+    async def conflict_once(method, payload):
+      nonlocal first
+      if method == "getUpdates" and first:
+        first = False
+        raise BotAPIError(409)
+      return await original_call(method, payload)
+
+    api.call.side_effect = conflict_once
+    worker = TelegramCommands(store, self.auth.telegram, None, api)
+
+    async def cooldown(seconds):
+      self.assertEqual(seconds, 60)
+      cooling.set()
+      await resume.wait()
+
+    worker.pause = cooldown
+    await worker.start(None)
+    self.addAsyncCleanup(worker.close, None)
+    await asyncio.wait_for(cooling.wait(), 3)
+    other_api = self.polling_api(asyncio.Event())
+    other = TelegramCommands(store, self.auth.telegram, None, other_api)
+    await other.start(None)
+    self.addAsyncCleanup(other.close, None)
+    for _ in range(50):
+      if other.status == "standby":
+        break
+      await asyncio.sleep(0.02)
+    self.assertEqual(other.status, "standby")
+    other_api.call.assert_not_awaited()
+    async with self.db.get_conn() as conn:
+      self.assertEqual(await conn.fetchval("SELECT count(*) FROM telegram_bot_offsets"), 0)
+    await other.close(None)
+    resume.set()
+    await asyncio.wait_for(reached.wait(), 3)
+    self.assertEqual(api.offsets, [0, 8])
+    self.assertEqual(await self.db.get_telegram_default_id(43), self.a)
+    await worker.close(None)
+
   async def test_blocked_recipient_does_not_poison_polling_queue(self):
     store = await self.polling_store()
     reached = asyncio.Event()
@@ -218,6 +263,11 @@ class TelegramDefaultTests(AdminGroupFixture):
     self.assertEqual(await self.db.get_telegram_default_id(43), self.a)
     api = self.polling_api(asyncio.Event(), webhook=True)
     blocked = TelegramCommands(store, self.auth.telegram, None, api)
+    async def stop_webhook_retry(seconds):
+      self.assertEqual(seconds, 60)
+      blocked.stopping.set()
+
+    blocked.pause = stop_webhook_retry
     await asyncio.wait_for(blocked.run(), 3)
-    self.assertEqual(blocked.status, "blocked")
+    self.assertEqual(blocked.status, "webhook")
     api.call.assert_awaited_once_with("getWebhookInfo", {})

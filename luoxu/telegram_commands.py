@@ -25,6 +25,13 @@ class BotAPIError(Exception):
     self.retry_after = min(max(retry_after, 1), 60)
 
 
+class WebhookConfigured(BotAPIError):
+  """A configured webhook must never be replaced by our polling worker."""
+
+  def __init__(self):
+    super().__init__(409)
+
+
 class BotAPI:
   def __init__(self, token, session):
     self._token = token
@@ -88,8 +95,10 @@ class TelegramCommands:
   async def register_menu(self):
     assert self.api is not None
     info = await self.api.call("getWebhookInfo", {})
-    if not isinstance(info, dict) or info.get("url"):
-      raise BotAPIError(409)  # Never delete or replace somebody else's webhook.
+    if not isinstance(info, dict):
+      raise BotAPIError
+    if info.get("url"):
+      raise WebhookConfigured  # Never delete or replace somebody else's webhook.
     me = await self.api.call("getMe", {})
     if (not isinstance(me, dict) or me.get("id") != self.bot_id
         or not isinstance(me.get("username"), str)):
@@ -108,6 +117,7 @@ class TelegramCommands:
 
   async def run(self):
     lock_name = f"luoxu:telegram-commands:{self.bot_id}"
+    conflict_delay = 60
     async with ClientSession(timeout=ClientTimeout(total=35)) as session:
       self.api = self.api or BotAPI(self.auth._token, session)
       while not self.stopping.is_set():
@@ -142,6 +152,7 @@ class TelegramCommands:
                   })
                   if not isinstance(updates, list):
                     raise BotAPIError
+                  conflict_delay = 60  # Reset only after a successful poll, not menu registration.
                   await conn.execute("SELECT 1")
                   progressed = False
                   for update in updates:
@@ -167,6 +178,19 @@ class TelegramCommands:
                     last_update = time.monotonic()
                   if updates and not progressed:
                     raise BotAPIError
+              except BotAPIError as exc:
+                if exc.code != 409:
+                  raise
+                # An interrupted long poll may overlap its replacement. Do not
+                # permanently abandon the worker, or rapidly compete with another
+                # consumer. Keep the lease during cooldown so replicas cannot bypass
+                # it; each retry rechecks the webhook before any getUpdates call.
+                self.status = "webhook" if isinstance(exc, WebhookConfigured) else "conflict"
+                logger.warning("Telegram commands %s (API status 409; retry in %ss)",
+                               self.status, conflict_delay)
+                await self.pause(conflict_delay)
+                conflict_delay = min(conflict_delay * 2, 300)
+                continue
               finally:
                 if not conn.is_closed():
                   # Fixed SQL; the lock namespace is bound, not interpolated.
@@ -175,7 +199,7 @@ class TelegramCommands:
         except asyncio.CancelledError:
           raise
         except BotAPIError as exc:
-          self.status = "blocked" if exc.code in (401, 409) else "retrying"
+          self.status = "blocked" if exc.code == 401 else "retrying"
           logger.warning("Telegram commands %s (API status %s)", self.status, exc.code)
           if self.status == "blocked":
             return

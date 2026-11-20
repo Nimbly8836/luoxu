@@ -29,6 +29,115 @@ def callback(uid, data, **changes):
                                          "date": int(time.time())}, "data": data, **changes}}
 
 
+class PollingRecoveryTests(unittest.IsolatedAsyncioTestCase):
+  async def asyncSetUp(self):
+    self.leased = False
+    self.outcomes = []
+    self.webhooks = []
+    self.offsets = []
+    self.delays = []
+    self.states = []
+    self.conn = MagicMock()
+    self.conn.is_closed.return_value = False
+
+    async def fetchval(sql, *args):
+      if "pg_try_advisory_lock" in sql:
+        self.leased = True
+        return True
+      return 11
+
+    async def execute(sql, *args):
+      if "pg_advisory_unlock" in sql:
+        self.leased = False
+
+    self.conn.fetchval = AsyncMock(side_effect=fetchval)
+    self.conn.execute = AsyncMock(side_effect=execute)
+    db = MagicMock()
+    db.pool.acquire.return_value.__aenter__.return_value = self.conn
+    self.api = MagicMock()
+    with patch.dict(os.environ, {"LUOXU_TELEGRAM_BOT_TOKEN": "123:synthetic"}):
+      auth = TelegramAuth({"enabled": True, "commands": {"enabled": True}})
+    self.service = TelegramCommands(db, auth, None, self.api)
+
+    async def call(method, payload):
+      if method == "getWebhookInfo":
+        return {"url": self.webhooks.pop(0) if self.webhooks else ""}
+      if method == "getUpdates":
+        self.offsets.append(payload["offset"])
+        value = self.outcomes.pop(0)
+        if isinstance(value, Exception):
+          raise value
+        if value is None:
+          self.service.stopping.set()
+          return []
+        return value
+      return {"getMe": {"id": 123, "username": "fixture_bot"},
+              "getMyCommands": [], "setMyCommands": True}[method]
+
+    async def pause(seconds):
+      if self.service.stopping.is_set():
+        return
+      self.assertTrue(self.leased, "Conflict cooldown must retain the singleton lease")
+      self.delays.append(seconds)
+      self.states.append(self.service.status)
+
+    self.api.call = AsyncMock(side_effect=call)
+    self.service.pause = pause
+
+  async def test_conflict_recovers_without_advancing_checkpoint(self):
+    self.outcomes = [BotAPIError(409), None]
+    await asyncio.wait_for(self.service.run(), 1)
+    self.assertEqual(self.delays, [60])
+    self.assertEqual(self.states, ["conflict"])
+    self.assertEqual(self.offsets, [11, 11])
+    self.assertFalse(self.leased)
+    self.assertFalse(any("INSERT" in call.args[0] for call in self.conn.execute.await_args_list))
+    self.assertEqual(sum(call.args[0] == "getWebhookInfo" for call in self.api.call.await_args_list), 2)
+
+  async def test_repeated_conflicts_back_off_and_only_successful_poll_resets_delay(self):
+    self.outcomes = [BotAPIError(409) for _ in range(5)] + [[], BotAPIError(409), None]
+    await asyncio.wait_for(self.service.run(), 1)
+    self.assertEqual(self.delays, [60, 120, 240, 300, 300, 60])
+    self.assertFalse(self.leased)
+
+  async def test_webhook_is_rechecked_without_polling_or_deleting_until_removed(self):
+    self.webhooks = ["https://other.invalid", "https://other.invalid", ""]
+    self.outcomes = [None]
+    await asyncio.wait_for(self.service.run(), 1)
+    self.assertEqual(self.delays, [60, 120])
+    self.assertEqual(self.states, ["webhook", "webhook"])
+    methods = [call.args[0] for call in self.api.call.await_args_list]
+    self.assertEqual(methods[:3], ["getWebhookInfo"] * 3)
+    self.assertEqual(methods.count("getUpdates"), 1)
+    self.assertNotIn("deleteWebhook", methods)
+    self.assertNotIn("setWebhook", methods)
+    self.assertFalse(self.leased)
+
+  async def test_invalid_token_stays_blocked_without_retry_storm(self):
+    self.outcomes = [BotAPIError(401)]
+    await asyncio.wait_for(self.service.run(), 1)
+    self.assertEqual(self.service.status, "blocked")
+    self.assertEqual(self.delays, [])
+    self.assertFalse(self.leased)
+
+  async def test_shutdown_cancels_conflict_cooldown_and_releases_lease(self):
+    self.outcomes = [BotAPIError(409)]
+    paused = asyncio.Event()
+
+    async def pause(seconds):
+      paused.set()
+      await asyncio.Event().wait()
+
+    self.service.pause = pause
+    await self.service.start(None)
+    self.addAsyncCleanup(self.service.close, None)
+    await asyncio.wait_for(paused.wait(), 1)
+    self.assertTrue(self.leased)
+    await asyncio.wait_for(self.service.close(None), 1)
+    self.assertFalse(self.leased)
+    self.assertEqual(self.service.status, "stopped")
+
+
 class CommandTests(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self):
     with patch.dict(os.environ, {"LUOXU_TELEGRAM_BOT_TOKEN": "123:synthetic"}):
